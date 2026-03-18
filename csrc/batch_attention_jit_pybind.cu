@@ -35,12 +35,12 @@ at::Tensor CascadeBatchPagedAttentionPlan(
     at::Tensor float_workspace_buffer,
     at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer,
-    at::Tensor qo_indptr,
+    std::vector<at::Tensor> qo_indptr_arr,
     std::vector<at::Tensor> kv_indptr_arr,
     std::vector<at::Tensor> kv_len_arr,
     std::vector<int64_t> causal_arr,
     std::vector<int64_t> kv_indices_num_pages,
-    int64_t num_levels, int64_t batch_size,
+    int64_t num_levels,
     int64_t num_qo_heads, int64_t num_kv_heads,
     int64_t head_dim_o);
 

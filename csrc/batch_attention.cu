@@ -203,12 +203,12 @@ at::Tensor CascadeBatchPagedAttentionPlan(
     at::Tensor float_workspace_buffer,
     at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer,
-    at::Tensor qo_indptr,
+    std::vector<at::Tensor> qo_indptr_arr,
     std::vector<at::Tensor> kv_indptr_arr,
     std::vector<at::Tensor> kv_len_arr,
     std::vector<int64_t> causal_arr,
     std::vector<int64_t> kv_indices_num_pages,
-    int64_t num_levels, int64_t batch_size,
+    int64_t num_levels,
     int64_t num_qo_heads, int64_t num_kv_heads,
     int64_t head_dim_o) {
   size_t float_workspace_size_in_bytes =
@@ -222,6 +222,8 @@ at::Tensor CascadeBatchPagedAttentionPlan(
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
   // Build host arrays of pointers to per-level data
+  std::vector<IdType*> qo_indptr_h_ptrs(num_levels);
+  std::vector<uint32_t> batch_size_arr(num_levels);
   std::vector<IdType*> kv_indptr_h_ptrs(num_levels);
   std::vector<IdType*> kv_len_h_ptrs(num_levels);
   std::unique_ptr<bool[]> causal_flags(new bool[num_levels]);
@@ -229,6 +231,8 @@ at::Tensor CascadeBatchPagedAttentionPlan(
 
   IdType running_offset = 0;
   for (int64_t l = 0; l < num_levels; ++l) {
+    qo_indptr_h_ptrs[l] = qo_indptr_arr[l].data_ptr<IdType>();
+    batch_size_arr[l] = static_cast<uint32_t>(qo_indptr_arr[l].size(0) - 1);
     kv_indptr_h_ptrs[l] = kv_indptr_arr[l].data_ptr<IdType>();
     kv_len_h_ptrs[l] = kv_len_arr[l].data_ptr<IdType>();
     causal_flags[l] = static_cast<bool>(causal_arr[l]);
@@ -241,12 +245,13 @@ at::Tensor CascadeBatchPagedAttentionPlan(
       int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
       int_workspace_size_in_bytes, plan_info,
       static_cast<uint32_t>(num_levels),
-      qo_indptr.data_ptr<IdType>(),
+      qo_indptr_h_ptrs.data(),
       kv_indptr_h_ptrs.data(),
       kv_len_h_ptrs.data(),
       kv_indices_level_offsets.data(),
       causal_flags.get(),
-      batch_size, num_qo_heads, num_kv_heads, head_dim_o, stream);
+      batch_size_arr.data(),
+      num_qo_heads, num_kv_heads, head_dim_o, stream);
 
   TORCH_CHECK(status == cudaSuccess,
               "Failed to plan cascade persistent attention, error: ", cudaGetErrorString(status));

@@ -240,7 +240,7 @@ class CascadeBatchAttention:
 
     def plan(
         self,
-        qo_indptr: torch.Tensor,
+        qo_indptr_arr: List[torch.Tensor],
         kv_indptr_arr: List[torch.Tensor],
         kv_indices_arr: List[torch.Tensor],
         kv_len_arr: List[torch.Tensor],
@@ -259,14 +259,15 @@ class CascadeBatchAttention:
 
         Parameters
         ----------
-        qo_indptr : torch.Tensor
-            QO indptr shared across all levels [batch_size+1].
+        qo_indptr_arr : List[torch.Tensor]
+            Per-level QO indptr arrays. Each level can have a different batch size,
+            but all must have the same total Q length (last element).
         kv_indptr_arr : List[torch.Tensor]
-            Per-level KV page table indptr arrays [batch_size+1].
+            Per-level KV page table indptr arrays.
         kv_indices_arr : List[torch.Tensor]
             Per-level KV page indices tensors.
         kv_len_arr : List[torch.Tensor]
-            Per-level KV length arrays [batch_size].
+            Per-level KV length arrays.
         causal : bool
             If True, causal masking is applied to the LAST level only.
         """
@@ -288,12 +289,11 @@ class CascadeBatchAttention:
         self.module = get_holistic_attention_module(*get_module_args)
 
         # Move to host
-        qo_indptr_host = qo_indptr.to("cpu", non_blocking=True)
+        qo_indptr_host_arr = [t.to("cpu", non_blocking=True) for t in qo_indptr_arr]
         kv_indptr_host_arr = [t.to("cpu", non_blocking=True) for t in kv_indptr_arr]
         kv_len_host_arr = [t.to("cpu", non_blocking=True) for t in kv_len_arr]
         torch.cuda.synchronize()
 
-        batch_size = kv_len_arr[0].shape[0]
         self._page_size = page_size
         self._sm_scale = sm_scale
         # Cascade always uses CAUSAL kernel mode (non-causal levels inflate kv_len)
@@ -328,13 +328,12 @@ class CascadeBatchAttention:
             self.float_workspace_buffer,
             self.int_workspace_buffer,
             self.page_locked_int_workspace_buffer,
-            qo_indptr_host,
+            qo_indptr_host_arr,
             kv_indptr_host_arr,
             kv_len_host_arr,
             causal_flags,
             kv_indices_num_pages,
             self._num_levels,
-            batch_size,
             num_qo_heads,
             num_kv_heads,
             head_dim_vo,

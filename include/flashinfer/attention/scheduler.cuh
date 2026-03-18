@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <sstream>
+#include <tuple>
 #include <vector>
 
 #include "../allocator.h"
@@ -1370,12 +1371,13 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
                                        size_t int_workspace_size_in_bytes,
                                        HolisticPlanInfo<2>& plan_info,
                                        uint32_t num_levels,
-                                       IdType* qo_indptr_h,
+                                       IdType** qo_indptr_h_arr,
                                        IdType** kv_indptr_h_arr,
                                        IdType** kv_len_arr_h_arr,
                                        IdType* kv_indices_level_offsets,
                                        bool* causal_arr,
-                                       uint32_t batch_size, uint32_t num_qo_heads,
+                                       uint32_t* batch_size_arr,
+                                       uint32_t num_qo_heads,
                                        uint32_t num_kv_heads, uint32_t head_dim,
                                        cudaStream_t stream) {
   constexpr uint32_t NUM_TASKS = 2;
@@ -1390,20 +1392,23 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
   num_sm *= 1;
 
   // Step 0: classify requests into Task 0 (prefill) or Task 1 (decode) based on packed_qo_len
-  // Store (request_idx, qo_len) per task
-  std::vector<std::pair<int, int>> idx_qo_len_vec[NUM_TASKS];
-  for (uint32_t i = 0; i < batch_size; ++i) {
-    int qo_len = qo_indptr_h[i + 1] - qo_indptr_h[i];
-    if (qo_len < 0) {
-      std::ostringstream err_msg;
-      err_msg << "qo_indptr[" << i + 1 << "] - qo_indptr[" << i << "] should be non-negative";
-      FLASHINFER_ERROR(err_msg.str());
-    }
-    int packed_qo_len = qo_len * gqa_group_size;
-    if (packed_qo_len > static_cast<int>(CTA_TILE_Q_SIZES[1])) {
-      idx_qo_len_vec[0].push_back({i, qo_len});
-    } else {
-      idx_qo_len_vec[1].push_back({i, qo_len});
+  // Store (level, request_idx, qo_len) per task
+  std::vector<std::tuple<uint32_t, uint32_t, int>> idx_qo_len_vec[NUM_TASKS];
+  for (uint32_t level = 0; level < num_levels; ++level) {
+    for (uint32_t i = 0; i < batch_size_arr[level]; ++i) {
+      int qo_len = qo_indptr_h_arr[level][i + 1] - qo_indptr_h_arr[level][i];
+      if (qo_len < 0) {
+        std::ostringstream err_msg;
+        err_msg << "qo_indptr[" << level << "][" << i + 1 << "] - qo_indptr[" << level << "]["
+                << i << "] should be non-negative";
+        FLASHINFER_ERROR(err_msg.str());
+      }
+      int packed_qo_len = qo_len * gqa_group_size;
+      if (packed_qo_len > static_cast<int>(CTA_TILE_Q_SIZES[1])) {
+        idx_qo_len_vec[0].push_back({level, i, qo_len});
+      } else {
+        idx_qo_len_vec[1].push_back({level, i, qo_len});
+      }
     }
   }
 
@@ -1430,27 +1435,33 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
   int64_t total_kv_lens = 0;
   for (uint32_t task = 0; task < NUM_TASKS; ++task) {
     int cluster_tile_q = CTA_TILE_Q_SIZES[task] * cluster_size;
-    for (auto& [i, qo_len] : idx_qo_len_vec[task]) {
+    for (auto& [level, i, qo_len] : idx_qo_len_vec[task]) {
       int packed_qo_len = qo_len * gqa_group_size;
       int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
       for (int qo_tile_idx = 0; qo_tile_idx < num_qo_tiles; ++qo_tile_idx) {
-        for (uint32_t level = 0; level < num_levels; ++level) {
-          int kv_len_level = kv_len_arr_h_arr[level][i];
-          int effective_kv_len = kv_len_level;
-          if (causal_arr[level]) {
-            effective_kv_len = packed_causal_kv_end(qo_len, kv_len_level, qo_tile_idx,
-                                                    cluster_tile_q, num_qo_tiles, gqa_group_size);
-          }
-          total_kv_lens += effective_kv_len;
+        int kv_len_level = kv_len_arr_h_arr[level][i];
+        int effective_kv_len = kv_len_level;
+        if (causal_arr[level]) {
+          effective_kv_len = packed_causal_kv_end(qo_len, kv_len_level, qo_tile_idx,
+                                                  cluster_tile_q, num_qo_tiles, gqa_group_size);
         }
+        total_kv_lens += effective_kv_len;
       }
     }
   }
 
-  int partial_o_nnz = 0;
+  // Pre-compute merge_indptr and partial_o_nnz based on total packed QO length
+  // All levels must have the same total Q length
+  uint32_t total_packed_qo_len = qo_indptr_h_arr[0][batch_size_arr[0]] * gqa_group_size;
+  int partial_o_nnz = total_packed_qo_len * num_levels;
+
   std::vector<IdType> merge_indptr, merge_o_indices, num_expand_qo_len_vec;
   std::vector<IdType> cluster_len_kv_chunk(NUM_TASKS, 0);
-  merge_indptr.push_back(partial_o_nnz);
+  for (uint32_t j = 0; j < total_packed_qo_len; ++j) {
+    merge_indptr.push_back(j * num_levels);
+    merge_o_indices.push_back(j / gqa_group_size);
+  }
+  merge_indptr.push_back(total_packed_qo_len * num_levels);
 
   for (uint32_t task = 0; task < NUM_TASKS; ++task) {
     int cluster_tile_q = CTA_TILE_Q_SIZES[task] * cluster_size;
@@ -1472,59 +1483,45 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
         cluster_cascade_num_kv_chunks(num_clusters),
         cluster_cascade_kv_chunk_idx(num_clusters);
 
-    for (auto& [i, qo_len] : idx_qo_len_vec[task]) {
+    for (auto& [level, i, qo_len] : idx_qo_len_vec[task]) {
       int packed_qo_len = qo_len * gqa_group_size;
       int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
 
       for (int qo_tile_idx = 0; qo_tile_idx < num_qo_tiles; ++qo_tile_idx) {
-        int row_tile_size = std::min(cluster_tile_q, packed_qo_len - qo_tile_idx * cluster_tile_q);
-
-        // For cascade: all levels for this (request, qo_tile) share partial_o base
-        IdType base_partial_o_nnz = partial_o_nnz;
-
-        // Create work items for ALL levels
-        for (uint32_t level = 0; level < num_levels; ++level) {
-          int kv_len_level = kv_len_arr_h_arr[level][i];
-          // Compute effective KV end for this level
-          int effective_kv_len = kv_len_level;
-          if (causal_arr[level]) {
-            effective_kv_len = packed_causal_kv_end(qo_len, kv_len_level, qo_tile_idx,
-                                                    cluster_tile_q, num_qo_tiles, gqa_group_size);
-          }
-
-          // kv_len stored per work item: inflate for non-causal levels to disable causal mask
-          // (kv_len - q_len becomes kv_len_level, making causal boundary beyond kv_end)
-          int kv_len_for_work = causal_arr[level] ? kv_len_level : (kv_len_level + qo_len);
-
-          // Adjusted kv_indptr: offset into concatenated kv_indices
-          IdType adjusted_kv_indptr = kv_indptr_h_arr[level][i] + kv_indices_level_offsets[level];
-
-          for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
-            auto [cluster_idx, accum_cost] = cluster_cost_heap.pop();
-            cluster_cost_heap.insert(
-                {cluster_idx, accum_cost + cost_function(cluster_tile_q, effective_kv_len)});
-
-            cluster_q_len[cluster_idx].push_back(qo_len);
-            cluster_kv_len[cluster_idx].push_back(kv_len_for_work);
-            cluster_q_indptr[cluster_idx].push_back(qo_indptr_h[i]);
-            cluster_kv_indptr[cluster_idx].push_back(adjusted_kv_indptr);
-            cluster_partial_indptr[cluster_idx].push_back(base_partial_o_nnz);
-            cluster_q_start[cluster_idx].push_back(qo_tile_idx * cluster_tile_q);
-            cluster_kv_start[cluster_idx].push_back(0);
-            cluster_kv_end[cluster_idx].push_back(effective_kv_len);
-            cluster_kv_head_idx[cluster_idx].push_back(kv_head_idx);
-            cluster_cascade_num_kv_chunks[cluster_idx].push_back(num_levels);
-            cluster_cascade_kv_chunk_idx[cluster_idx].push_back(level);
-          }
+        int kv_len_level = kv_len_arr_h_arr[level][i];
+        int effective_kv_len = kv_len_level;
+        if (causal_arr[level]) {
+          effective_kv_len = packed_causal_kv_end(qo_len, kv_len_level, qo_tile_idx,
+                                                  cluster_tile_q, num_qo_tiles, gqa_group_size);
         }
 
-        // merge_indptr: for each row in this tile, there are num_levels partials
-        for (int row = 0; row < row_tile_size; ++row) {
-          merge_indptr.push_back(merge_indptr.back() + num_levels);
-          merge_o_indices.push_back(qo_indptr_h[i] +
-                                    (qo_tile_idx * cluster_tile_q + row) / gqa_group_size);
+        // kv_len stored per work item: inflate for non-causal levels to disable causal mask
+        int kv_len_for_work = causal_arr[level] ? kv_len_level : (kv_len_level + qo_len);
+
+        // Adjusted kv_indptr: offset into concatenated kv_indices
+        IdType adjusted_kv_indptr = kv_indptr_h_arr[level][i] + kv_indices_level_offsets[level];
+
+        // Partial output index: first packed QO row of this tile * num_levels
+        IdType first_packed_row = qo_indptr_h_arr[level][i] * gqa_group_size +
+                                  qo_tile_idx * cluster_tile_q;
+
+        for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
+          auto [cluster_idx, accum_cost] = cluster_cost_heap.pop();
+          cluster_cost_heap.insert(
+              {cluster_idx, accum_cost + cost_function(cluster_tile_q, effective_kv_len)});
+
+          cluster_q_len[cluster_idx].push_back(qo_len);
+          cluster_kv_len[cluster_idx].push_back(kv_len_for_work);
+          cluster_q_indptr[cluster_idx].push_back(qo_indptr_h_arr[level][i]);
+          cluster_kv_indptr[cluster_idx].push_back(adjusted_kv_indptr);
+          cluster_partial_indptr[cluster_idx].push_back(first_packed_row * num_levels);
+          cluster_q_start[cluster_idx].push_back(qo_tile_idx * cluster_tile_q);
+          cluster_kv_start[cluster_idx].push_back(0);
+          cluster_kv_end[cluster_idx].push_back(effective_kv_len);
+          cluster_kv_head_idx[cluster_idx].push_back(kv_head_idx);
+          cluster_cascade_num_kv_chunks[cluster_idx].push_back(num_levels);
+          cluster_cascade_kv_chunk_idx[cluster_idx].push_back(level);
         }
-        partial_o_nnz += row_tile_size * num_levels;
       }
     }
 
