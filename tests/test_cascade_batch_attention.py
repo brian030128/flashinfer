@@ -151,7 +151,7 @@ def test_cascade_batch_attention_correctness():
         [shared_kv_indices[:shared_kv_indptr[1]], unique_kv_indices],
         [shared_last_page_len[:1], unique_last_page_len],
         num_heads, num_heads, head_dim, page_size,
-        causal=False,
+        causal=True,
     )
     o_ref = ref_wrapper.run(q, kv_data)
 
@@ -164,7 +164,7 @@ def test_cascade_batch_attention_correctness():
         [shared_kv_len_tensor, unique_kv_len_tensor],
         num_heads, num_heads, head_dim, head_dim,
         page_size,
-        causal=False,
+        causal=True,
         q_data_type=torch.float16,
         kv_data_type=torch.float16,
     )
@@ -179,7 +179,7 @@ def benchmark_cascade(warmup=50, repeat=200):
     """Benchmark CascadeBatchAttention vs MultiLevelCascadeAttentionWrapper."""
     torch.manual_seed(42)
 
-    shared_kv_len = 4096
+    shared_kv_len = 1024
     unique_kv_len = 8
     batch_size = 16
     num_heads = 8
@@ -199,6 +199,34 @@ def benchmark_cascade(warmup=50, repeat=200):
 
     q = torch.randn(batch_size * qo_len, num_heads, head_dim, device="cuda", dtype=torch.float16)
     qo_indptr = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+
+    # --- Setup flat paged decode (no cascade, full kv per request) ---
+    total_kv_len = shared_kv_len + unique_kv_len
+    num_shared_pages = ceil_div(shared_kv_len, page_size)
+    num_unique_pages = ceil_div(unique_kv_len, page_size)
+    flat_kv_indices_list = []
+    for b in range(batch_size):
+        flat_kv_indices_list.append(shared_kv_indices[:num_shared_pages])
+        flat_kv_indices_list.append(
+            unique_kv_indices[b * num_unique_pages : (b + 1) * num_unique_pages]
+        )
+    flat_kv_indices = torch.cat(flat_kv_indices_list)
+    flat_pages_per_req = num_shared_pages + num_unique_pages
+    flat_kv_indptr = (
+        torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * flat_pages_per_req
+    )
+    flat_last_page_len = torch.full(
+        (batch_size,), (total_kv_len - 1) % page_size + 1, device="cuda", dtype=torch.int32
+    )
+
+    flat_decode = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "NHD"
+    )
+    flat_decode.plan(
+        flat_kv_indptr, flat_kv_indices, flat_last_page_len,
+        num_heads, num_heads, head_dim, page_size,
+        data_type=torch.float16,
+    )
 
     # --- Setup reference ---
     ref_wrapper = flashinfer.MultiLevelCascadeAttentionWrapper(
@@ -229,9 +257,23 @@ def benchmark_cascade(warmup=50, repeat=200):
     )
 
     # Pre-allocate output buffers
-    out_ref = torch.empty_like(q)
     out_cascade = torch.empty_like(q)
     lse_cascade = torch.empty(q.shape[0], q.shape[1], device="cuda", dtype=torch.float32)
+
+    # --- Benchmark Flat Paged Decode (no cascade) ---
+    for _ in range(warmup):
+        flat_decode.run(q, kv_data)
+    torch.cuda.synchronize()
+
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+    for i in range(repeat):
+        start_events[i].record()
+        flat_decode.run(q, kv_data)
+        end_events[i].record()
+    torch.cuda.synchronize()
+    flat_times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    flat_median = sorted(flat_times)[len(flat_times) // 2]
 
     # --- Benchmark MultiLevel (reference) ---
     for _ in range(warmup):
@@ -268,9 +310,11 @@ def benchmark_cascade(warmup=50, repeat=200):
     print(f"  shared_kv_len={shared_kv_len}, unique_kv_len={unique_kv_len}")
     print(f"  batch_size={batch_size}, num_heads={num_heads}, head_dim={head_dim}")
     print(f"{'='*60}")
-    print(f"  MultiLevel (N kernels + merge): {ref_median:.4f} ms (median)")
+    print(f"  Flat Paged Decode (no cascade):  {flat_median:.4f} ms (median)")
+    print(f"  MultiLevel (N kernels + merge):  {ref_median:.4f} ms (median)")
     print(f"  Fused Cascade (1 kernel):        {cascade_median:.4f} ms (median)")
-    print(f"  Speedup: {ref_median / cascade_median:.2f}x")
+    print(f"  Speedup vs MultiLevel:           {ref_median / cascade_median:.2f}x")
+    print(f"  Speedup vs Flat Decode:          {flat_median / cascade_median:.2f}x")
     print(f"{'='*60}")
 
 
