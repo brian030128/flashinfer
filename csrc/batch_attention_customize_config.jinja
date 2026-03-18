@@ -90,6 +90,11 @@ struct PersistentParams {
   IdType* work_indptr;
   IdType* len_kv_chunk;
 
+  // cascade: per-work-item override for partial_o layout
+  // nullptr for non-cascade usage
+  IdType* cascade_num_kv_chunks_arr;
+  IdType* cascade_kv_chunk_idx_arr;
+
   // for state reduction
   IdType* merge_indptr;
   IdType* merge_o_indices;

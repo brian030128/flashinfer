@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 import math
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -183,6 +183,185 @@ class BatchAttention:
             # ADDITIONAL_FUNC_PARAMS
             # PROFILER_FUNC_PARAMS
             *profiler_args,
+        )
+
+        return out, lse
+
+
+class CascadeBatchAttention:
+    """Fused multi-level cascade attention using a single persistent kernel.
+
+    All cascade levels are processed in one cooperative kernel launch. The reduction
+    runner merges cross-level and cross-chunk partials in a single pass after grid sync.
+
+    Requires num_levels >= 2. All levels share the same Q tensor and qo_indptr.
+    Causal masking is typically applied only to the last level.
+    """
+
+    def __init__(
+        self,
+        num_levels: int,
+        kv_layout: str = "NHD",
+        device: str = "cuda",
+    ):
+        assert num_levels >= 2, "CascadeBatchAttention requires num_levels >= 2"
+        _check_kv_layout(kv_layout)
+        self._num_levels = num_levels
+        self._kv_layout = kv_layout
+
+        self.float_workspace_buffer = torch.empty(
+            384 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=torch.device(device),
+        )
+        self.int_workspace_buffer = torch.empty(
+            8 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=torch.device(device),
+        )
+        self.page_locked_int_workspace_buffer = torch.empty(
+            8 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=torch.device("cpu"),
+            pin_memory=True,
+        )
+
+    def plan(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr_arr: List[torch.Tensor],
+        kv_indices_arr: List[torch.Tensor],
+        kv_len_arr: List[torch.Tensor],
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim_qk: int,
+        head_dim_vo: int,
+        page_size: int,
+        causal: bool = False,
+        sm_scale: Optional[float] = None,
+        logits_soft_cap: Optional[float] = None,
+        q_data_type: torch.dtype = torch.bfloat16,
+        kv_data_type: torch.dtype = torch.bfloat16,
+    ) -> None:
+        """Plan cascade attention.
+
+        Parameters
+        ----------
+        qo_indptr : torch.Tensor
+            QO indptr shared across all levels [batch_size+1].
+        kv_indptr_arr : List[torch.Tensor]
+            Per-level KV page table indptr arrays [batch_size+1].
+        kv_indices_arr : List[torch.Tensor]
+            Per-level KV page indices tensors.
+        kv_len_arr : List[torch.Tensor]
+            Per-level KV length arrays [batch_size].
+        causal : bool
+            If True, causal masking is applied to the LAST level only.
+        """
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+        self._logits_soft_cap = logits_soft_cap
+
+        get_module_args = (
+            q_data_type,
+            kv_data_type,
+            q_data_type,
+            kv_indptr_arr[0].dtype,
+            head_dim_qk,
+            head_dim_vo,
+            PosEncodingMode["NONE"].value,
+            logits_soft_cap > 0.0,
+            False,  # use_profiler
+        )
+        self.module = get_holistic_attention_module(*get_module_args)
+
+        # Move to host
+        qo_indptr_host = qo_indptr.to("cpu", non_blocking=True)
+        kv_indptr_host_arr = [t.to("cpu", non_blocking=True) for t in kv_indptr_arr]
+        kv_len_host_arr = [t.to("cpu", non_blocking=True) for t in kv_len_arr]
+        torch.cuda.synchronize()
+
+        batch_size = kv_len_arr[0].shape[0]
+        self._page_size = page_size
+        self._sm_scale = sm_scale
+        # Cascade always uses CAUSAL kernel mode (non-causal levels inflate kv_len)
+        self._mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
+        self._num_qo_heads = num_qo_heads
+        self._num_kv_heads = num_kv_heads
+
+        # Concatenate kv_indices from all levels
+        self._kv_indices = torch.cat(kv_indices_arr, dim=0)
+
+        # Per-level causal flags: only last level is causal (if causal=True)
+        causal_flags = [0] * self._num_levels
+        if causal:
+            causal_flags[-1] = 1
+
+        # Number of pages per level (for computing level offsets)
+        kv_indices_num_pages = [t.shape[0] for t in kv_indices_arr]
+
+        self._plan_info = self.module.cascade_plan(
+            self.float_workspace_buffer,
+            self.int_workspace_buffer,
+            self.page_locked_int_workspace_buffer,
+            qo_indptr_host,
+            kv_indptr_host_arr,
+            kv_len_host_arr,
+            causal_flags,
+            kv_indices_num_pages,
+            self._num_levels,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_vo,
+        )
+
+    def run(
+        self,
+        q: torch.Tensor,
+        kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
+        logits_soft_cap: float = 0.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run fused cascade attention.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Query tensor [total_q_len, num_qo_heads, head_dim].
+        kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            Paged KV cache shared across all levels.
+        """
+        k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, self._kv_layout)
+        if out is None:
+            out = torch.empty_like(q)
+        if lse is None:
+            lse = torch.empty(
+                q.shape[0], q.shape[1], device=q.device, dtype=torch.float32
+            )
+        head_dim_qk = q.shape[2]
+        if self._sm_scale is None:
+            self._sm_scale = 1.0 / math.sqrt(head_dim_qk)
+
+        # Reuse the existing run function — it handles cascade via plan_info
+        self.module.run(
+            self.float_workspace_buffer,
+            self.int_workspace_buffer,
+            self._plan_info,
+            q,
+            k_cache,
+            v_cache,
+            self._kv_indices,
+            out,
+            lse,
+            self._mask_mode,
+            TensorLayout[self._kv_layout].value,
+            self._num_qo_heads,
+            self._num_kv_heads,
+            self._page_size,
+            self._sm_scale,
+            logits_soft_cap,
         )
 
         return out, lse

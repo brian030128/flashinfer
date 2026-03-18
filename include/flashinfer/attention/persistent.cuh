@@ -266,12 +266,19 @@ struct BlockBatchPagedAttentionPersistent {
       const auto [q_indptr, kv_indptr, o_indptr, q_len, kv_len, packed_qo_start, kv_start, kv_end,
                   kv_head_idx, len_kv_chunk] = get_block_coord(params, work_idx);
 
-      const uint32_t kv_chunk_idx = kv_start / len_kv_chunk;
-      const uint32_t num_kv_chunks = ceil_div(
-          CAUSAL
-              ? min((kv_len - q_len) + (packed_qo_start + cluster_tile_q) / gqa_group_size, kv_len)
-              : kv_len,
-          len_kv_chunk);
+      // Cascade: override num_kv_chunks and kv_chunk_idx from per-work-item arrays
+      uint32_t kv_chunk_idx, num_kv_chunks;
+      if (params.cascade_num_kv_chunks_arr != nullptr) {
+        kv_chunk_idx = params.cascade_kv_chunk_idx_arr[work_idx];
+        num_kv_chunks = params.cascade_num_kv_chunks_arr[work_idx];
+      } else {
+        kv_chunk_idx = kv_start / len_kv_chunk;
+        num_kv_chunks = ceil_div(
+            CAUSAL
+                ? min((kv_len - q_len) + (packed_qo_start + cluster_tile_q) / gqa_group_size, kv_len)
+                : kv_len,
+            len_kv_chunk);
+      }
       const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * CTA_TILE_Q +
                                           get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16;
       const uint32_t qo_upperbound =
@@ -303,7 +310,10 @@ struct BlockBatchPagedAttentionPersistent {
       uint32_t block_iter_base = kv_indptr * block_size + kv_start;
       // last kv tile
       __syncthreads();
-      uint32_t packed_kv_bound = kv_indptr * block_size + kv_len;
+      // Use kv_end instead of kv_len for bounds check. This is safe because positions
+      // beyond kv_end are masked out. Using kv_end allows cascade to inflate kv_len
+      // (for disabling causal masking on non-causal levels) without invalid page access.
+      uint32_t packed_kv_bound = kv_indptr * block_size + kv_end;
 
       prefetch_offest<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
                                kv_head_idx, k_stride_page, k_stride_h, k_stride_n, block_size,

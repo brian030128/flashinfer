@@ -1013,6 +1013,9 @@ struct HolisticPlanInfo {
     int64_t kv_end_offset;
     int64_t kv_head_idx_offset;
     int64_t work_indptr_offset;
+    // Cascade-specific: per-work-item arrays, -1 if not cascade
+    int64_t cascade_num_kv_chunks_offset;
+    int64_t cascade_kv_chunk_idx_offset;
   } tasks[NUM_TASKS];
   int64_t len_kv_chunk_offset;
   int64_t partial_o_offset;
@@ -1021,7 +1024,7 @@ struct HolisticPlanInfo {
   int64_t merge_o_indices_offset;
   int64_t num_qo_len_offset;
 
-  static constexpr uint32_t NUM_TASK_ARGS = 10;
+  static constexpr uint32_t NUM_TASK_ARGS = 12;
   static constexpr uint32_t NUM_SHARED_ARGS = 8;
 
   std::vector<int64_t> ToVector() const {
@@ -1039,6 +1042,8 @@ struct HolisticPlanInfo {
       vec.push_back(tasks[i].kv_end_offset);
       vec.push_back(tasks[i].kv_head_idx_offset);
       vec.push_back(tasks[i].work_indptr_offset);
+      vec.push_back(tasks[i].cascade_num_kv_chunks_offset);
+      vec.push_back(tasks[i].cascade_kv_chunk_idx_offset);
     }
     vec.push_back(len_kv_chunk_offset);
     vec.push_back(partial_o_offset);
@@ -1069,6 +1074,8 @@ struct HolisticPlanInfo {
       tasks[i].kv_end_offset = vec[2 + i * NUM_TASK_ARGS + 7];
       tasks[i].kv_head_idx_offset = vec[2 + i * NUM_TASK_ARGS + 8];
       tasks[i].work_indptr_offset = vec[2 + i * NUM_TASK_ARGS + 9];
+      tasks[i].cascade_num_kv_chunks_offset = vec[2 + i * NUM_TASK_ARGS + 10];
+      tasks[i].cascade_kv_chunk_idx_offset = vec[2 + i * NUM_TASK_ARGS + 11];
     }
     len_kv_chunk_offset = vec[2 + NUM_TASKS * NUM_TASK_ARGS];
     partial_o_offset = vec[3 + NUM_TASKS * NUM_TASK_ARGS];
@@ -1097,14 +1104,10 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
 
-  if (head_dim >= 256) {
-    // NOTE (Yilong): optimize this code path
-    // constraint gridDim due to cooperative group
-    num_sm *= 1;
-  } else {
-    // NOTE(Zihao): two cta per sm
-    num_sm *= 2;
-  }
+  // NOTE: cooperative kernel launch limits total blocks to occupancy * num_SMs.
+  // For CTA_TILE_Q=128 with head_dim<256, occupancy is often 1 block/SM on Ampere,
+  // so num_sm*2 would exceed the cooperative launch limit. Use num_sm*1 to be safe.
+  num_sm *= 1;
 
   // step 0. determine the number of blocks in x and y dimensions
   std::vector<std::tuple<int, int, int>> idx_qo_kv_len_vec[NUM_TASKS];
@@ -1284,6 +1287,9 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
         int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "kv_head_idx");
     plan_info.tasks[task].work_indptr_offset =
         int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "work_indptr");
+    // Non-cascade: no per-work-item cascade arrays
+    plan_info.tasks[task].cascade_num_kv_chunks_offset = -1;
+    plan_info.tasks[task].cascade_kv_chunk_idx_offset = -1;
 
     CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].q_indptr_offset,
                            q_indptr_vec);
@@ -1336,6 +1342,293 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   constexpr size_t sizeof_dtype_o = 2;  // NOTE (Yilong): assume fp16
 
   // Note(Yilong): times num_kv_heads as it is not counted in partial_o_nnz
+  AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
+  plan_info.partial_o_offset = float_allocator.aligned_alloc_offset(
+      max_num_kv_splits * sizeof_dtype_o * head_dim * num_kv_heads, 16, "holistic_partial_o");
+  plan_info.partial_lse_offset = float_allocator.aligned_alloc_offset(
+      max_num_kv_splits * sizeof(float) * num_kv_heads, 16, "holistic_partial_lse");
+
+  return cudaSuccess;
+}
+
+/*!
+ * \brief Cascade attention scheduler: fuses multiple KV-cache levels into one
+ *   persistent kernel launch. Each (request, level) becomes a work item.
+ *   All levels share the same queries (qo_indptr). The reduction runner merges
+ *   cross-level and cross-chunk partials in a single pass.
+ *
+ * \param num_levels Number of cascade levels (>= 2)
+ * \param qo_indptr_h Host qo_indptr array [batch_size+1] (shared across levels)
+ * \param kv_indptr_h_arr Array of num_levels host kv_indptr arrays [batch_size+1]
+ * \param kv_len_arr_h_arr Array of num_levels host kv_len arrays [batch_size]
+ * \param kv_indices_level_offsets Offset into concatenated kv_indices for each level [num_levels]
+ * \param causal_arr Per-level causal flag [num_levels]
+ */
+template <typename IdType>
+inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspace_size_in_bytes,
+                                       void* int_buffer, void* page_locked_int_buffer,
+                                       size_t int_workspace_size_in_bytes,
+                                       HolisticPlanInfo<2>& plan_info,
+                                       uint32_t num_levels,
+                                       IdType* qo_indptr_h,
+                                       IdType** kv_indptr_h_arr,
+                                       IdType** kv_len_arr_h_arr,
+                                       IdType* kv_indices_level_offsets,
+                                       bool* causal_arr,
+                                       uint32_t batch_size, uint32_t num_qo_heads,
+                                       uint32_t num_kv_heads, uint32_t head_dim,
+                                       cudaStream_t stream) {
+  constexpr uint32_t NUM_TASKS = 2;
+  const uint32_t CTA_TILE_Q_SIZES[NUM_TASKS] = {128, 16};
+  int num_sm = 0;
+  int dev_id = 0;
+
+  uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+
+  num_sm *= 1;
+
+  // Step 0: classify requests into Task 0 (prefill) or Task 1 (decode) based on packed_qo_len
+  // Store (request_idx, qo_len) per task
+  std::vector<std::pair<int, int>> idx_qo_len_vec[NUM_TASKS];
+  for (uint32_t i = 0; i < batch_size; ++i) {
+    int qo_len = qo_indptr_h[i + 1] - qo_indptr_h[i];
+    if (qo_len < 0) {
+      std::ostringstream err_msg;
+      err_msg << "qo_indptr[" << i + 1 << "] - qo_indptr[" << i << "] should be non-negative";
+      FLASHINFER_ERROR(err_msg.str());
+    }
+    int packed_qo_len = qo_len * gqa_group_size;
+    if (packed_qo_len > static_cast<int>(CTA_TILE_Q_SIZES[1])) {
+      idx_qo_len_vec[0].push_back({i, qo_len});
+    } else {
+      idx_qo_len_vec[1].push_back({i, qo_len});
+    }
+  }
+
+  int cluster_size = 1;
+  int num_clusters = num_sm / cluster_size;
+  plan_info.num_blks_x = cluster_size;
+  plan_info.num_blks_y = num_clusters;
+
+  auto f = [](int x) {
+    if (x <= 128) {
+      return 128;
+    }
+    return ceil_div(x, 256) * 256;
+  };
+
+  MinHeap cluster_cost_heap(num_clusters);
+  AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
+
+  const int max_total_num_works = 65536;
+  const int max_num_kv_splits =
+      4 * num_clusters * cluster_size * (CTA_TILE_Q_SIZES[0] + CTA_TILE_Q_SIZES[1]);
+
+  // Compute total KV lens across all levels for kv_len_limit estimation
+  int64_t total_kv_lens = 0;
+  for (uint32_t task = 0; task < NUM_TASKS; ++task) {
+    int cluster_tile_q = CTA_TILE_Q_SIZES[task] * cluster_size;
+    for (auto& [i, qo_len] : idx_qo_len_vec[task]) {
+      int packed_qo_len = qo_len * gqa_group_size;
+      int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
+      for (int qo_tile_idx = 0; qo_tile_idx < num_qo_tiles; ++qo_tile_idx) {
+        for (uint32_t level = 0; level < num_levels; ++level) {
+          int kv_len_level = kv_len_arr_h_arr[level][i];
+          int effective_kv_len = kv_len_level;
+          if (causal_arr[level]) {
+            effective_kv_len = packed_causal_kv_end(qo_len, kv_len_level, qo_tile_idx,
+                                                    cluster_tile_q, num_qo_tiles, gqa_group_size);
+          }
+          total_kv_lens += effective_kv_len;
+        }
+      }
+    }
+  }
+
+  int partial_o_nnz = 0;
+  std::vector<IdType> merge_indptr, merge_o_indices, num_expand_qo_len_vec;
+  std::vector<IdType> cluster_len_kv_chunk(NUM_TASKS, 0);
+  merge_indptr.push_back(partial_o_nnz);
+
+  for (uint32_t task = 0; task < NUM_TASKS; ++task) {
+    int cluster_tile_q = CTA_TILE_Q_SIZES[task] * cluster_size;
+    int kv_len_limit = f(std::max(ceil_div(total_kv_lens * num_kv_heads, num_clusters), 1L));
+    if (cluster_tile_q >= 64) {
+      kv_len_limit /= std::min(num_kv_heads, 2U);
+    }
+    cluster_len_kv_chunk[task] = kv_len_limit;
+
+    std::vector<std::vector<IdType>> cluster_q_indptr(num_clusters),
+        cluster_kv_indptr(num_clusters),
+        cluster_q_len(num_clusters),
+        cluster_kv_len(num_clusters),
+        cluster_q_start(num_clusters),
+        cluster_kv_start(num_clusters),
+        cluster_kv_end(num_clusters),
+        cluster_kv_head_idx(num_clusters),
+        cluster_partial_indptr(num_clusters),
+        cluster_cascade_num_kv_chunks(num_clusters),
+        cluster_cascade_kv_chunk_idx(num_clusters);
+
+    for (auto& [i, qo_len] : idx_qo_len_vec[task]) {
+      int packed_qo_len = qo_len * gqa_group_size;
+      int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
+
+      for (int qo_tile_idx = 0; qo_tile_idx < num_qo_tiles; ++qo_tile_idx) {
+        int row_tile_size = std::min(cluster_tile_q, packed_qo_len - qo_tile_idx * cluster_tile_q);
+
+        // For cascade: all levels for this (request, qo_tile) share partial_o base
+        IdType base_partial_o_nnz = partial_o_nnz;
+
+        // Create work items for ALL levels
+        for (uint32_t level = 0; level < num_levels; ++level) {
+          int kv_len_level = kv_len_arr_h_arr[level][i];
+          // Compute effective KV end for this level
+          int effective_kv_len = kv_len_level;
+          if (causal_arr[level]) {
+            effective_kv_len = packed_causal_kv_end(qo_len, kv_len_level, qo_tile_idx,
+                                                    cluster_tile_q, num_qo_tiles, gqa_group_size);
+          }
+
+          // kv_len stored per work item: inflate for non-causal levels to disable causal mask
+          // (kv_len - q_len becomes kv_len_level, making causal boundary beyond kv_end)
+          int kv_len_for_work = causal_arr[level] ? kv_len_level : (kv_len_level + qo_len);
+
+          // Adjusted kv_indptr: offset into concatenated kv_indices
+          IdType adjusted_kv_indptr = kv_indptr_h_arr[level][i] + kv_indices_level_offsets[level];
+
+          for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
+            auto [cluster_idx, accum_cost] = cluster_cost_heap.pop();
+            cluster_cost_heap.insert(
+                {cluster_idx, accum_cost + cost_function(cluster_tile_q, effective_kv_len)});
+
+            cluster_q_len[cluster_idx].push_back(qo_len);
+            cluster_kv_len[cluster_idx].push_back(kv_len_for_work);
+            cluster_q_indptr[cluster_idx].push_back(qo_indptr_h[i]);
+            cluster_kv_indptr[cluster_idx].push_back(adjusted_kv_indptr);
+            cluster_partial_indptr[cluster_idx].push_back(base_partial_o_nnz);
+            cluster_q_start[cluster_idx].push_back(qo_tile_idx * cluster_tile_q);
+            cluster_kv_start[cluster_idx].push_back(0);
+            cluster_kv_end[cluster_idx].push_back(effective_kv_len);
+            cluster_kv_head_idx[cluster_idx].push_back(kv_head_idx);
+            cluster_cascade_num_kv_chunks[cluster_idx].push_back(num_levels);
+            cluster_cascade_kv_chunk_idx[cluster_idx].push_back(level);
+          }
+        }
+
+        // merge_indptr: for each row in this tile, there are num_levels partials
+        for (int row = 0; row < row_tile_size; ++row) {
+          merge_indptr.push_back(merge_indptr.back() + num_levels);
+          merge_o_indices.push_back(qo_indptr_h[i] +
+                                    (qo_tile_idx * cluster_tile_q + row) / gqa_group_size);
+        }
+        partial_o_nnz += row_tile_size * num_levels;
+      }
+    }
+
+    // Build flat arrays and allocate workspace
+    std::vector<IdType> work_indptr_vec(num_clusters + 1, 0);
+    for (uint32_t c = 0; c < static_cast<uint32_t>(num_clusters); ++c) {
+      work_indptr_vec[c + 1] = work_indptr_vec[c] + cluster_q_indptr[c].size();
+    }
+    int total_num_works = work_indptr_vec.back();
+    if (total_num_works > max_total_num_works) {
+      std::ostringstream err_msg;
+      err_msg << "total_num_works " << total_num_works
+              << " exceeds max_total_num_works " << max_total_num_works;
+      FLASHINFER_ERROR(err_msg.str());
+    }
+    auto q_indptr_vec = flatten(cluster_q_indptr, total_num_works);
+    auto kv_indptr_vec = flatten(cluster_kv_indptr, total_num_works);
+    auto partial_indptr_vec = flatten(cluster_partial_indptr, total_num_works);
+    auto q_len_vec = flatten(cluster_q_len, total_num_works);
+    auto kv_len_vec = flatten(cluster_kv_len, total_num_works);
+    auto q_start_vec = flatten(cluster_q_start, total_num_works);
+    auto kv_start_vec = flatten(cluster_kv_start, total_num_works);
+    auto kv_end_vec = flatten(cluster_kv_end, total_num_works);
+    auto kv_head_idx_vec = flatten(cluster_kv_head_idx, total_num_works);
+    auto cascade_num_kv_chunks_vec = flatten(cluster_cascade_num_kv_chunks, total_num_works);
+    auto cascade_kv_chunk_idx_vec = flatten(cluster_cascade_kv_chunk_idx, total_num_works);
+
+    plan_info.tasks[task].q_indptr_offset =
+        int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "q_indptr");
+    plan_info.tasks[task].kv_indptr_offset =
+        int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "kv_indptr");
+    plan_info.tasks[task].partial_indptr_offset = int_allocator.aligned_alloc_offset(
+        sizeof(IdType) * max_total_num_works, 16, "partial_indptr");
+    plan_info.tasks[task].q_len_offset =
+        int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "q_len");
+    plan_info.tasks[task].kv_len_offset =
+        int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "kv_len");
+    plan_info.tasks[task].q_start_offset =
+        int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "q_start");
+    plan_info.tasks[task].kv_start_offset =
+        int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "kv_start");
+    plan_info.tasks[task].kv_end_offset =
+        int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "kv_end");
+    plan_info.tasks[task].kv_head_idx_offset =
+        int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "kv_head_idx");
+    plan_info.tasks[task].work_indptr_offset =
+        int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "work_indptr");
+    plan_info.tasks[task].cascade_num_kv_chunks_offset =
+        int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "cascade_num_kv_chunks");
+    plan_info.tasks[task].cascade_kv_chunk_idx_offset =
+        int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "cascade_kv_chunk_idx");
+
+    CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].q_indptr_offset,
+                           q_indptr_vec);
+    CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].kv_indptr_offset,
+                           kv_indptr_vec);
+    CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].partial_indptr_offset,
+                           partial_indptr_vec);
+    CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].q_len_offset, q_len_vec);
+    CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].kv_len_offset, kv_len_vec);
+    CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].q_start_offset,
+                           q_start_vec);
+    CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].kv_start_offset,
+                           kv_start_vec);
+    CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].kv_end_offset, kv_end_vec);
+    CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].kv_head_idx_offset,
+                           kv_head_idx_vec);
+    CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].work_indptr_offset,
+                           work_indptr_vec);
+    CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].cascade_num_kv_chunks_offset,
+                           cascade_num_kv_chunks_vec);
+    CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.tasks[task].cascade_kv_chunk_idx_offset,
+                           cascade_kv_chunk_idx_vec);
+  }
+
+  plan_info.len_kv_chunk_offset =
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * NUM_TASKS, 16, "len_kv_chunk");
+  CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.len_kv_chunk_offset,
+                         cluster_len_kv_chunk);
+
+  if (merge_indptr.size() > static_cast<size_t>(max_num_kv_splits)) {
+    std::ostringstream err_msg;
+    err_msg << "Number of kv splits " << merge_indptr.size() << " exceeds max buffer size "
+            << max_num_kv_splits;
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
+  num_expand_qo_len_vec.push_back(merge_indptr.size() - 1);
+  plan_info.merge_indptr_offset =
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * max_num_kv_splits, 16, "merge_indptr");
+  plan_info.merge_o_indices_offset =
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * max_num_kv_splits, 16, "merge_o_indices");
+  plan_info.num_qo_len_offset =
+      int_allocator.aligned_alloc_offset(sizeof(IdType), 16, "num_qo_len_offset");
+  CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.merge_indptr_offset, merge_indptr);
+  CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.merge_o_indices_offset, merge_o_indices);
+  CopyToPageLockedBuffer(page_locked_int_buffer, plan_info.num_qo_len_offset,
+                         num_expand_qo_len_vec);
+
+  size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
+                                       cudaMemcpyHostToDevice, stream));
+  constexpr size_t sizeof_dtype_o = 2;  // NOTE: assume fp16
+
   AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
   plan_info.partial_o_offset = float_allocator.aligned_alloc_offset(
       max_num_kv_splits * sizeof_dtype_o * head_dim * num_kv_heads, 16, "holistic_partial_o");

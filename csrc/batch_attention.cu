@@ -17,6 +17,7 @@
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/layout.cuh>
 #include <flashinfer/pos_enc.cuh>
+#include <memory>
 #include <optional>
 
 #include "batch_attention_config.inc"
@@ -141,6 +142,17 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].work_indptr_offset);
           params[i].len_kv_chunk = len_kv_chunk + i;
 
+          // Cascade fields
+          if (plan_info.tasks[i].cascade_num_kv_chunks_offset >= 0) {
+            params[i].cascade_num_kv_chunks_arr = GetPtrFromBaseOffset<IdType>(
+                int_buffer_ptr, plan_info.tasks[i].cascade_num_kv_chunks_offset);
+            params[i].cascade_kv_chunk_idx_arr = GetPtrFromBaseOffset<IdType>(
+                int_buffer_ptr, plan_info.tasks[i].cascade_kv_chunk_idx_offset);
+          } else {
+            params[i].cascade_num_kv_chunks_arr = nullptr;
+            params[i].cascade_kv_chunk_idx_arr = nullptr;
+          }
+
           params[i].final_o = static_cast<DTypeO*>(o.data_ptr());
           params[i].final_lse =
               maybe_lse.has_value() ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
@@ -185,4 +197,59 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
                     cudaGetErrorString(status));
         return true;
       });
+}
+
+at::Tensor CascadeBatchPagedAttentionPlan(
+    at::Tensor float_workspace_buffer,
+    at::Tensor int_workspace_buffer,
+    at::Tensor page_locked_int_workspace_buffer,
+    at::Tensor qo_indptr,
+    std::vector<at::Tensor> kv_indptr_arr,
+    std::vector<at::Tensor> kv_len_arr,
+    std::vector<int64_t> causal_arr,
+    std::vector<int64_t> kv_indices_num_pages,
+    int64_t num_levels, int64_t batch_size,
+    int64_t num_qo_heads, int64_t num_kv_heads,
+    int64_t head_dim_o) {
+  size_t float_workspace_size_in_bytes =
+      float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
+  size_t int_workspace_size_in_bytes =
+      int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
+
+  HolisticPlanInfo<2> plan_info;
+
+  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+  // Build host arrays of pointers to per-level data
+  std::vector<IdType*> kv_indptr_h_ptrs(num_levels);
+  std::vector<IdType*> kv_len_h_ptrs(num_levels);
+  std::unique_ptr<bool[]> causal_flags(new bool[num_levels]);
+  std::vector<IdType> kv_indices_level_offsets(num_levels);
+
+  IdType running_offset = 0;
+  for (int64_t l = 0; l < num_levels; ++l) {
+    kv_indptr_h_ptrs[l] = kv_indptr_arr[l].data_ptr<IdType>();
+    kv_len_h_ptrs[l] = kv_len_arr[l].data_ptr<IdType>();
+    causal_flags[l] = static_cast<bool>(causal_arr[l]);
+    kv_indices_level_offsets[l] = running_offset;
+    running_offset += static_cast<IdType>(kv_indices_num_pages[l]);
+  }
+
+  cudaError_t status = CascadeHolisticPlan<IdType>(
+      float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
+      int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
+      int_workspace_size_in_bytes, plan_info,
+      static_cast<uint32_t>(num_levels),
+      qo_indptr.data_ptr<IdType>(),
+      kv_indptr_h_ptrs.data(),
+      kv_len_h_ptrs.data(),
+      kv_indices_level_offsets.data(),
+      causal_flags.get(),
+      batch_size, num_qo_heads, num_kv_heads, head_dim_o, stream);
+
+  TORCH_CHECK(status == cudaSuccess,
+              "Failed to plan cascade persistent attention, error: ", cudaGetErrorString(status));
+
+  return vec_to_tensor(plan_info.ToVector());
 }

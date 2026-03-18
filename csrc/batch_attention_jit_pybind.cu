@@ -31,7 +31,21 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
                             int64_t page_size, double sm_scale,
                             double logits_soft_cap ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS);
 
+at::Tensor CascadeBatchPagedAttentionPlan(
+    at::Tensor float_workspace_buffer,
+    at::Tensor int_workspace_buffer,
+    at::Tensor page_locked_int_workspace_buffer,
+    at::Tensor qo_indptr,
+    std::vector<at::Tensor> kv_indptr_arr,
+    std::vector<at::Tensor> kv_len_arr,
+    std::vector<int64_t> causal_arr,
+    std::vector<int64_t> kv_indices_num_pages,
+    int64_t num_levels, int64_t batch_size,
+    int64_t num_qo_heads, int64_t num_kv_heads,
+    int64_t head_dim_o);
+
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("plan", &BatchPagedAttentionPlan);
   m.def("run", &BatchPagedAttentionRun);
+  m.def("cascade_plan", &CascadeBatchPagedAttentionPlan);
 }
