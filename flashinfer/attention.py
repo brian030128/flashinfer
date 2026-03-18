@@ -203,11 +203,23 @@ class CascadeBatchAttention:
         num_levels: int,
         kv_layout: str = "NHD",
         device: str = "cuda",
+        use_cuda_graph: bool = False,
+        kv_indices_buffer: Optional[torch.Tensor] = None,
     ):
         assert num_levels >= 2, "CascadeBatchAttention requires num_levels >= 2"
         _check_kv_layout(kv_layout)
         self._num_levels = num_levels
         self._kv_layout = kv_layout
+        self._use_cuda_graph = use_cuda_graph
+
+        if use_cuda_graph:
+            if kv_indices_buffer is None:
+                raise ValueError(
+                    "kv_indices_buffer must be provided when use_cuda_graph=True"
+                )
+            self._kv_indices_buf = kv_indices_buffer
+        else:
+            self._kv_indices_buf = None
 
         self.float_workspace_buffer = torch.empty(
             384 * 1024 * 1024,
@@ -290,7 +302,19 @@ class CascadeBatchAttention:
         self._num_kv_heads = num_kv_heads
 
         # Concatenate kv_indices from all levels
-        self._kv_indices = torch.cat(kv_indices_arr, dim=0)
+        kv_indices_cat = torch.cat(kv_indices_arr, dim=0)
+        if self._use_cuda_graph:
+            if len(kv_indices_cat) > len(self._kv_indices_buf):
+                raise ValueError(
+                    f"kv_indices ({len(kv_indices_cat)}) exceeds "
+                    f"kv_indices_buffer size ({len(self._kv_indices_buf)})"
+                )
+            self._kv_indices_buf[: len(kv_indices_cat)].copy_(
+                kv_indices_cat, non_blocking=True
+            )
+            self._kv_indices = self._kv_indices_buf
+        else:
+            self._kv_indices = kv_indices_cat
 
         # Per-level causal flags: only last level is causal (if causal=True)
         causal_flags = [0] * self._num_levels

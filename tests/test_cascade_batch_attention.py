@@ -318,6 +318,89 @@ def benchmark_cascade(warmup=50, repeat=200):
     print(f"{'='*60}")
 
 
+def test_cascade_batch_attention_cuda_graph():
+    """Test CascadeBatchAttention with CUDA graph capture and replay."""
+    torch.manual_seed(42)
+
+    shared_kv_len = 1024
+    unique_kv_len = 8
+    batch_size = 16
+    num_heads = 8
+    head_dim = 128
+    page_size = 16
+    qo_len = 1
+
+    (
+        kv_data,
+        shared_kv_indices, shared_kv_indptr, shared_last_page_len,
+        shared_kv_len_tensor,
+        unique_kv_indices, unique_kv_indptr, unique_last_page_len,
+        unique_kv_len_tensor,
+    ) = build_cascade_kv_cache(
+        shared_kv_len, unique_kv_len, batch_size, num_heads, head_dim, page_size
+    )
+
+    q = torch.randn(batch_size * qo_len, num_heads, head_dim, device="cuda", dtype=torch.float16)
+    qo_indptr = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[0], q.shape[1], device="cuda", dtype=torch.float32)
+
+    # Pre-allocate kv_indices buffer large enough for all levels
+    total_kv_pages = shared_kv_indices.shape[0] + unique_kv_indices.shape[0]
+    kv_indices_buffer = torch.empty(total_kv_pages, device="cuda", dtype=torch.int32)
+
+    cascade = CascadeBatchAttention(
+        num_levels=2, kv_layout="NHD", device="cuda",
+        use_cuda_graph=True, kv_indices_buffer=kv_indices_buffer,
+    )
+    cascade.plan(
+        qo_indptr,
+        [shared_kv_indptr, unique_kv_indptr],
+        [shared_kv_indices, unique_kv_indices],
+        [shared_kv_len_tensor, unique_kv_len_tensor],
+        num_heads, num_heads, head_dim, head_dim,
+        page_size, causal=False,
+        q_data_type=torch.float16, kv_data_type=torch.float16,
+    )
+
+    # Warmup
+    cascade.run(q, kv_data, out=out, lse=lse)
+    torch.cuda.synchronize()
+
+    # Capture CUDA graph
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        cascade.run(q, kv_data, out=out, lse=lse)
+
+    # Replay
+    graph.replay()
+    torch.cuda.synchronize()
+    o_graph = out.clone()
+
+    # Compare against non-graph run
+    cascade_no_graph = CascadeBatchAttention(num_levels=2, kv_layout="NHD", device="cuda")
+    cascade_no_graph.plan(
+        qo_indptr,
+        [shared_kv_indptr, unique_kv_indptr],
+        [shared_kv_indices, unique_kv_indices],
+        [shared_kv_len_tensor, unique_kv_len_tensor],
+        num_heads, num_heads, head_dim, head_dim,
+        page_size, causal=False,
+        q_data_type=torch.float16, kv_data_type=torch.float16,
+    )
+    o_ref, _ = cascade_no_graph.run(q, kv_data)
+
+    torch.testing.assert_close(o_graph, o_ref, atol=1e-3, rtol=1e-3)
+    print(f"[PASS] CUDA graph test: max diff = {(o_graph - o_ref).abs().max().item():.6f}")
+
+    # Replay again to verify stability
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, o_ref, atol=1e-3, rtol=1e-3)
+    print(f"[PASS] CUDA graph replay test: max diff = {(out - o_ref).abs().max().item():.6f}")
+
+
 if __name__ == "__main__":
     test_cascade_batch_attention_correctness()
+    test_cascade_batch_attention_cuda_graph()
     benchmark_cascade()
