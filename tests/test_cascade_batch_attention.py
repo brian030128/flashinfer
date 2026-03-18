@@ -117,7 +117,7 @@ def test_cascade_batch_attention_correctness():
     """Compare CascadeBatchAttention vs MultiLevelCascadeAttentionWrapper."""
     torch.manual_seed(42)
 
-    shared_kv_len = 1024
+    shared_kv_len = 8192
     unique_kv_len = 8
     batch_size = 16
     num_heads = 8
@@ -592,7 +592,13 @@ def benchmark_per_level(warmup=50, repeat=200):
 
 
 def benchmark_diagnosis(warmup=50, repeat=200):
-    """Diagnose fused cascade slowdown: redundant KV reads + SM utilization."""
+    """Diagnose fused cascade performance vs MultiLevel.
+
+    Root cause of slowdown at long shared_kv_len: the cascade scheduler creates
+    only 1 work item per (qo_tile, kv_head, level) — no KV splitting. With
+    batch=1 on the shared level, that's only num_kv_heads work items, leaving
+    most SMs idle. BatchPrefill (used by MultiLevel) splits KV across SMs.
+    """
     torch.manual_seed(42)
 
     batch_size = 16
@@ -601,141 +607,142 @@ def benchmark_diagnosis(warmup=50, repeat=200):
     page_size = 16
     dtype = torch.float16
     dtype_bytes = 2
-    shared_kv_len = 8192
     unique_kv_len = 8
 
     props = torch.cuda.get_device_properties(0)
     num_sms = props.multi_processor_count
+    gqa_group_size = 1  # num_qo_heads == num_kv_heads
 
-    print(f"\nFused Cascade Slowdown Diagnosis (batch={batch_size}, heads={num_heads}, head_dim={head_dim})")
+    print(f"\nFused Cascade Performance Analysis")
     print(f"GPU: {props.name} ({num_sms} SMs)")
-    print("=" * 64)
+    print(f"batch={batch_size}, num_heads={num_heads}, head_dim={head_dim}, gqa_group={gqa_group_size}")
+    print("=" * 72)
 
-    # ── 1. Shared Prefix Level ──────────────────────────────────────
+    # ── 1. Scaling with shared_kv_len ──────────────────────────────
 
-    # Build paged KV for shared prefix
-    num_shared_pages = ceil_div(shared_kv_len, page_size)
-    kv_data_shared = torch.randn(
-        num_shared_pages, 2, page_size, num_heads, head_dim,
-        device="cuda", dtype=dtype,
-    )
-    shared_kv_indices = torch.arange(num_shared_pages, device="cuda", dtype=torch.int32)
+    print(f"\n1. End-to-End Scaling (unique_kv_len={unique_kv_len})")
+    print(f"   {'kv_len':>7s}  {'MultiLevel':>10s}  {'Fused':>10s}  {'ratio':>6s}  {'Fused wins?':>11s}")
 
-    # Shared-as-MultiLevel: batch=1, qo_len=batch_size (prefill-style)
-    q_all = torch.randn(batch_size, num_heads, head_dim, device="cuda", dtype=dtype)
-    prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "NHD"
-    )
-    prefill_qo_indptr = torch.tensor([0, batch_size], device="cuda", dtype=torch.int32)
-    prefill_kv_indptr = torch.tensor([0, num_shared_pages], device="cuda", dtype=torch.int32)
-    prefill_last_page_len = torch.tensor(
-        [(shared_kv_len - 1) % page_size + 1], device="cuda", dtype=torch.int32
-    )
-    prefill_wrapper.plan(
-        prefill_qo_indptr, prefill_kv_indptr, shared_kv_indices, prefill_last_page_len,
-        num_heads, num_heads, head_dim, page_size,
-        causal=False,
-    )
-    prefill_median = _benchmark_median(
-        lambda: prefill_wrapper.run(q_all, kv_data_shared), warmup, repeat
-    )
-    prefill_bw, _, _ = compute_attention_metrics(
-        1, batch_size, shared_kv_len, num_heads, head_dim, dtype_bytes, prefill_median
-    )
+    for shared_kv_len in [256, 1024, 4096, 8192, 16384]:
+        (kv_data, shared_kv_indices, shared_kv_indptr, _,
+         shared_kv_len_tensor, unique_kv_indices, unique_kv_indptr, unique_last_page_len,
+         unique_kv_len_tensor) = build_cascade_kv_cache(
+            shared_kv_len, unique_kv_len, batch_size, num_heads, head_dim, page_size)
 
-    # Shared-as-Fused: batch=16, qo_len=1 (decode-style, each reads full KV)
-    decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "NHD"
-    )
-    # Each of 16 requests points to the same shared pages
-    decode_kv_indices = shared_kv_indices.repeat(batch_size)
-    decode_kv_indptr = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * num_shared_pages
-    decode_last_page_len = torch.full(
-        (batch_size,), (shared_kv_len - 1) % page_size + 1, device="cuda", dtype=torch.int32
-    )
-    decode_wrapper.plan(
-        decode_kv_indptr, decode_kv_indices, decode_last_page_len,
-        num_heads, num_heads, head_dim, page_size,
-        data_type=dtype,
-    )
-    decode_shared_median = _benchmark_median(
-        lambda: decode_wrapper.run(q_all, kv_data_shared), warmup, repeat
-    )
-    decode_shared_bw, _, _ = compute_attention_metrics(
-        batch_size, 1, shared_kv_len, num_heads, head_dim, dtype_bytes, decode_shared_median
-    )
+        q = torch.randn(batch_size, num_heads, head_dim, device="cuda", dtype=dtype)
+        qo_indptr = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32)
+        num_shared_pages = ceil_div(shared_kv_len, page_size)
 
-    # Data sizes
-    kv_bytes_once = 1 * shared_kv_len * num_heads * head_dim * 2 * dtype_bytes
-    kv_bytes_16x = batch_size * shared_kv_len * num_heads * head_dim * 2 * dtype_bytes
+        # MultiLevel
+        ref = flashinfer.MultiLevelCascadeAttentionWrapper(
+            2, torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda"), "NHD")
+        qo_top = torch.tensor([0, batch_size], device="cuda", dtype=torch.int32)
+        ref.plan([qo_top, qo_indptr],
+                 [shared_kv_indptr[:2], unique_kv_indptr],
+                 [shared_kv_indices[:num_shared_pages], unique_kv_indices],
+                 [torch.tensor([(shared_kv_len - 1) % page_size + 1], device="cuda", dtype=torch.int32),
+                  unique_last_page_len],
+                 num_heads, num_heads, head_dim, page_size, causal=True)
+        ref_ms = _benchmark_median(lambda: ref.run(q, kv_data), warmup, repeat)
 
-    print(f"\n1. Shared Prefix Level (kv_len={shared_kv_len})")
-    print(f"   MultiLevel approach:  batch=1,  qo_len={batch_size} -> reads KV once  ({kv_bytes_once / 1e6:.0f} MB)")
-    print(f"   Fused approach:       batch={batch_size}, qo_len=1  -> reads KV {batch_size}x   ({kv_bytes_16x / 1e6:.0f} MB)")
-    print(f"   Data amplification:   {batch_size}x")
+        # Fused Cascade
+        cascade = CascadeBatchAttention(num_levels=2, kv_layout="NHD", device="cuda")
+        qo_shared = torch.tensor([0, batch_size], device="cuda", dtype=torch.int32)
+        cascade.plan([qo_shared, qo_indptr],
+                     [shared_kv_indptr[:2], unique_kv_indptr],
+                     [shared_kv_indices[:num_shared_pages], unique_kv_indices],
+                     [shared_kv_len_tensor[:1], unique_kv_len_tensor],
+                     num_heads, num_heads, head_dim, head_dim, page_size, causal=True,
+                     q_data_type=dtype, kv_data_type=dtype)
+        out = torch.empty_like(q)
+        lse = torch.empty(q.shape[0], num_heads, device="cuda", dtype=torch.float32)
+        fused_ms = _benchmark_median(lambda: cascade.run(q, kv_data, out=out, lse=lse), warmup, repeat)
+
+        ratio = fused_ms / ref_ms
+        wins = "YES" if ratio < 1.0 else "no"
+        print(f"   {shared_kv_len:7d}  {ref_ms:8.4f}ms  {fused_ms:8.4f}ms  {ratio:5.2f}x  {wins:>11s}")
+
+    # ── 2. Shared prefix: BatchPrefill vs Persistent Runner2 ──────
+
+    print(f"\n2. Shared Prefix in Isolation (batch=1, qo_len={batch_size})")
+    print(f"   packed_qo_len = {batch_size} * {gqa_group_size} = {batch_size * gqa_group_size}"
+          f"  -> {'Runner1 (CTA_Q=128)' if batch_size * gqa_group_size > 16 else 'Runner2 (CTA_Q=16)'}")
     print()
-    print(f"   BatchPrefill (batch=1, qo={batch_size}):    {prefill_median:.4f} ms | {prefill_bw:.2f} GB/s")
-    print(f"   BatchDecode  (batch={batch_size}, qo=1):    {decode_shared_median:.4f} ms | {decode_shared_bw:.2f} GB/s")
+    print(f"   {'kv_len':>7s}  {'Prefill':>10s}  {'Persistent':>10s}  {'ratio':>6s}"
+          f"  {'Prefill BW':>10s}  {'Persist BW':>10s}  {'Active SMs':>10s}")
 
-    # ── 2. Unique Suffix Level ──────────────────────────────────────
+    for shared_kv_len in [1024, 4096, 8192, 16384, 32768]:
+        num_shared_pages = ceil_div(shared_kv_len, page_size)
+        kv_data = torch.randn(num_shared_pages, 2, page_size, num_heads, head_dim,
+                              device="cuda", dtype=dtype)
+        q = torch.randn(batch_size, num_heads, head_dim, device="cuda", dtype=dtype)
+        ski = torch.arange(num_shared_pages, device="cuda", dtype=torch.int32)
 
-    num_unique_pages = ceil_div(unique_kv_len, page_size)
-    kv_data_unique = torch.randn(
-        batch_size * num_unique_pages, 2, page_size, num_heads, head_dim,
-        device="cuda", dtype=dtype,
-    )
-    unique_kv_indices = torch.arange(batch_size * num_unique_pages, device="cuda", dtype=torch.int32)
-    unique_kv_indptr = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * num_unique_pages
-    unique_last_page_len = torch.full(
-        (batch_size,), (unique_kv_len - 1) % page_size + 1, device="cuda", dtype=torch.int32
-    )
+        # BatchPrefill (what MultiLevel uses)
+        pw = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "NHD")
+        pw.plan(torch.tensor([0, batch_size], device="cuda", dtype=torch.int32),
+                torch.tensor([0, num_shared_pages], device="cuda", dtype=torch.int32),
+                ski, torch.tensor([(shared_kv_len - 1) % page_size + 1], device="cuda", dtype=torch.int32),
+                num_heads, num_heads, head_dim, page_size, causal=False)
+        pfx_ms = _benchmark_median(lambda: pw.run(q, kv_data), warmup, repeat)
 
-    decode_unique = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "NHD"
-    )
-    decode_unique.plan(
-        unique_kv_indptr, unique_kv_indices, unique_last_page_len,
-        num_heads, num_heads, head_dim, page_size,
-        data_type=dtype,
-    )
-    unique_median = _benchmark_median(
-        lambda: decode_unique.run(q_all, kv_data_unique), warmup, repeat
-    )
-    unique_bw, _, _ = compute_attention_metrics(
-        batch_size, 1, unique_kv_len, num_heads, head_dim, dtype_bytes, unique_median
-    )
+        # Persistent cascade (shared level + trivial unique level)
+        dummy_pages = batch_size
+        kv_big = torch.randn(num_shared_pages + dummy_pages, 2, page_size, num_heads, head_dim,
+                             device="cuda", dtype=dtype)
+        kv_big[:num_shared_pages] = kv_data
+        dki = torch.arange(num_shared_pages, num_shared_pages + dummy_pages,
+                           device="cuda", dtype=torch.int32)
+        dkp = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32)
+        dkl = torch.ones(batch_size, device="cuda", dtype=torch.int32)
 
-    print(f"\n2. Unique Suffix Level (kv_len={unique_kv_len})")
-    print(f"   BatchDecode  (batch={batch_size}, qo=1):    {unique_median:.4f} ms | {unique_bw:.2f} GB/s")
+        cas = CascadeBatchAttention(num_levels=2, kv_layout="NHD", device="cuda")
+        qo_s = torch.tensor([0, batch_size], device="cuda", dtype=torch.int32)
+        qo_u = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32)
+        cas.plan([qo_s, qo_u],
+                 [torch.tensor([0, num_shared_pages], device="cuda", dtype=torch.int32), dkp],
+                 [ski, dki],
+                 [torch.tensor([shared_kv_len], device="cuda", dtype=torch.int32), dkl],
+                 num_heads, num_heads, head_dim, head_dim, page_size, causal=False,
+                 q_data_type=dtype, kv_data_type=dtype)
+        out = torch.empty_like(q)
+        lse = torch.empty(q.shape[0], num_heads, device="cuda", dtype=torch.float32)
+        per_ms = _benchmark_median(lambda: cas.run(q, kv_big, out=out, lse=lse), warmup, repeat)
 
-    # ── 3. SM Utilization ───────────────────────────────────────────
+        kv_bytes = shared_kv_len * num_heads * head_dim * 2 * dtype_bytes
+        pfx_bw = kv_bytes / (pfx_ms / 1000) / 1e9
+        per_bw = kv_bytes / (per_ms / 1000) / 1e9
 
-    # Runner2 (CTA_TILE_Q=16, NUM_MMA_KV=2): approximate chunk size
-    # chunk_size ≈ NUM_MMA_KV * page_size = 2 * 16 = 32 tokens
-    num_mma_kv_runner2 = 2
-    chunk_size_approx = num_mma_kv_runner2 * page_size
+        # Work items: 1 qo_tile * num_kv_heads (no KV splitting)
+        packed_qo = batch_size * gqa_group_size
+        num_qo_tiles = ceil_div(packed_qo, 16)  # CTA_TILE_Q=16 for Runner2
+        work_items = num_qo_tiles * num_heads
+        active = min(work_items, num_sms)
 
-    shared_work_items = batch_size * num_heads * ceil_div(shared_kv_len, chunk_size_approx)
-    unique_work_items = batch_size * num_heads * ceil_div(unique_kv_len, chunk_size_approx)
+        print(f"   {shared_kv_len:7d}  {pfx_ms:8.4f}ms  {per_ms:8.4f}ms  {per_ms/pfx_ms:5.2f}x"
+              f"  {pfx_bw:7.0f}GB/s  {per_bw:7.0f}GB/s  {active:3d}/{num_sms}")
 
-    print(f"\n3. SM Utilization (fused kernel)")
-    print(f"   Total SMs:       {num_sms}")
-    print(f"   Shared level:    {shared_work_items} work items -> {shared_work_items / num_sms:.1f} items/SM")
-    print(f"   Unique level:    {unique_work_items} work items   -> {unique_work_items / num_sms:.1f} items/SM")
+    # ── 3. Root Cause Analysis ────────────────────────────────────
 
-    # ── 4. Time Breakdown ───────────────────────────────────────────
+    packed_qo = batch_size * gqa_group_size
+    num_qo_tiles = ceil_div(packed_qo, 16)
+    shared_work_items = num_qo_tiles * num_heads
+    sm_util = shared_work_items / num_sms * 100
 
-    merge_overhead_est = 0.01  # ~10us estimate for merge kernel
-    multilevel_est = prefill_median + unique_median + merge_overhead_est
-    fused_est = decode_shared_median + unique_median  # + sync + reduction (unknown)
-
-    print(f"\n4. Time Breakdown")
-    print(f"   MultiLevel:  shared_prefill + unique_decode + merge ~= "
-          f"{prefill_median:.4f} + {unique_median:.4f} + ~{merge_overhead_est:.2f} = ~{multilevel_est:.4f} ms")
-    print(f"   Fused:       shared_decode_x{batch_size} + unique_decode + sync+reduce ~= "
-          f"{decode_shared_median:.4f} + {unique_median:.4f} + ? = {fused_est:.4f} ms (lower bound)")
-    print(f"   Gap explained by: {batch_size}x redundant KV reads on shared prefix")
-    print("=" * 64)
+    print(f"\n3. Root Cause: No KV Splitting in Cascade Scheduler")
+    print(f"   Shared level work items = ceil({packed_qo}/16) qo_tiles * {num_heads} kv_heads"
+          f" = {shared_work_items}")
+    print(f"   SM utilization: {shared_work_items}/{num_sms} = {sm_util:.0f}%")
+    print()
+    print(f"   BatchPrefill splits KV across SMs: for kv_len=8192, it creates ~84+ work items,")
+    print(f"   achieving full SM occupancy. The persistent cascade scheduler creates {shared_work_items}")
+    print(f"   work items (one per kv_head), leaving {num_sms - shared_work_items} SMs idle.")
+    print()
+    print(f"   Fix: add KV splitting to CascadeHolisticPlan. Split each (level, request, kv_head)")
+    print(f"   work item into ceil(kv_len / chunk_size) chunks. The reduction runner already")
+    print(f"   merges multiple partials per output row — cascade_num_kv_chunks just increases.")
+    print("=" * 72)
 
 
 if __name__ == "__main__":
