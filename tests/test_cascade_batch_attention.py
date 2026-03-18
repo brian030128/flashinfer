@@ -117,7 +117,7 @@ def test_cascade_batch_attention_correctness():
     """Compare CascadeBatchAttention vs MultiLevelCascadeAttentionWrapper."""
     torch.manual_seed(42)
 
-    shared_kv_len = 8192
+    shared_kv_len = 1024
     unique_kv_len = 8
     batch_size = 16
     num_heads = 8
@@ -325,6 +325,163 @@ def benchmark_cascade(warmup=50, repeat=200):
     print(f"  Speedup vs MultiLevel:           {ref_median / cascade_median:.2f}x")
     print(f"  Speedup vs Flat Decode:          {flat_median / cascade_median:.2f}x")
     print(f"{'='*60}")
+
+    # === CUDA Graph Benchmarking across shared prefix lengths ===
+
+    shared_kv_lens = [256, 512, 1024, 2048, 4096, 8192, 16384]
+    results = []
+
+    for skv_len in shared_kv_lens:
+        torch.manual_seed(42)
+
+        (
+            kv_data_g,
+            shared_kv_indices_g, shared_kv_indptr_g, shared_last_page_len_g,
+            shared_kv_len_tensor_g,
+            unique_kv_indices_g, unique_kv_indptr_g, unique_last_page_len_g,
+            unique_kv_len_tensor_g,
+        ) = build_cascade_kv_cache(
+            skv_len, unique_kv_len, batch_size, num_heads, head_dim, page_size
+        )
+
+        q_g = torch.randn(batch_size * qo_len, num_heads, head_dim, device="cuda", dtype=torch.float16)
+        qo_indptr_g = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+
+        num_shared_pages_g = ceil_div(skv_len, page_size)
+        num_unique_pages_g = ceil_div(unique_kv_len, page_size)
+
+        # --- Flat Decode with CUDA Graph ---
+        total_kv_len_g = skv_len + unique_kv_len
+        flat_kv_indices_list_g = []
+        for b in range(batch_size):
+            flat_kv_indices_list_g.append(shared_kv_indices_g[:num_shared_pages_g])
+            flat_kv_indices_list_g.append(
+                unique_kv_indices_g[b * num_unique_pages_g : (b + 1) * num_unique_pages_g]
+            )
+        flat_kv_indices_g = torch.cat(flat_kv_indices_list_g)
+        flat_pages_per_req_g = num_shared_pages_g + num_unique_pages_g
+        flat_kv_indptr_g = (
+            torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * flat_pages_per_req_g
+        )
+        flat_last_page_len_g = torch.full(
+            (batch_size,), (total_kv_len_g - 1) % page_size + 1, device="cuda", dtype=torch.int32
+        )
+
+        flat_decode_g = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "NHD"
+        )
+        flat_decode_g.plan(
+            flat_kv_indptr_g, flat_kv_indices_g, flat_last_page_len_g,
+            num_heads, num_heads, head_dim, page_size,
+            data_type=torch.float16,
+        )
+
+        for _ in range(warmup):
+            flat_decode_g.run(q_g, kv_data_g)
+        torch.cuda.synchronize()
+
+        flat_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(flat_graph):
+            flat_decode_g.run(q_g, kv_data_g)
+
+        start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+        end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+        for i in range(repeat):
+            start_events[i].record()
+            flat_graph.replay()
+            end_events[i].record()
+        torch.cuda.synchronize()
+        flat_graph_times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+        flat_graph_median = sorted(flat_graph_times)[len(flat_graph_times) // 2]
+
+        # --- MultiLevel with CUDA Graph ---
+        ref_wrapper_g = flashinfer.MultiLevelCascadeAttentionWrapper(
+            2, torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda"), "NHD"
+        )
+        qo_indptr_top_g = torch.tensor([0, q_g.shape[0]], device="cuda", dtype=torch.int32)
+        ref_wrapper_g.plan(
+            [qo_indptr_top_g, qo_indptr_g],
+            [shared_kv_indptr_g[:2], unique_kv_indptr_g],
+            [shared_kv_indices_g[:num_shared_pages_g], unique_kv_indices_g],
+            [shared_last_page_len_g[:1], unique_last_page_len_g],
+            num_heads, num_heads, head_dim, page_size,
+            causal=True,
+        )
+
+        for _ in range(warmup):
+            ref_wrapper_g.run(q_g, kv_data_g)
+        torch.cuda.synchronize()
+
+        ref_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(ref_graph):
+            ref_wrapper_g.run(q_g, kv_data_g)
+
+        start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+        end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+        for i in range(repeat):
+            start_events[i].record()
+            ref_graph.replay()
+            end_events[i].record()
+        torch.cuda.synchronize()
+        ref_graph_times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+        ref_graph_median = sorted(ref_graph_times)[len(ref_graph_times) // 2]
+
+        # --- Fused Cascade with CUDA Graph ---
+        total_kv_pages_g = num_shared_pages_g + unique_kv_indices_g.shape[0]
+        kv_indices_buffer_g = torch.empty(total_kv_pages_g, device="cuda", dtype=torch.int32)
+
+        qo_indptr_shared_g = torch.tensor([0, batch_size * qo_len], device="cuda", dtype=torch.int32)
+        qo_indptr_unique_g = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+
+        cascade_graph_wrapper = CascadeBatchAttention(
+            num_levels=2, kv_layout="NHD", device="cuda",
+            use_cuda_graph=True, kv_indices_buffer=kv_indices_buffer_g,
+        )
+        cascade_graph_wrapper.plan(
+            [qo_indptr_shared_g, qo_indptr_unique_g],
+            [shared_kv_indptr_g[:2], unique_kv_indptr_g],
+            [shared_kv_indices_g[:num_shared_pages_g], unique_kv_indices_g],
+            [shared_kv_len_tensor_g[:1], unique_kv_len_tensor_g],
+            num_heads, num_heads, head_dim, head_dim,
+            page_size,
+            causal=True,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+        )
+
+        out_g = torch.empty_like(q_g)
+        lse_g = torch.empty(q_g.shape[0], q_g.shape[1], device="cuda", dtype=torch.float32)
+
+        for _ in range(warmup):
+            cascade_graph_wrapper.run(q_g, kv_data_g, out=out_g, lse=lse_g)
+        torch.cuda.synchronize()
+
+        cascade_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cascade_graph):
+            cascade_graph_wrapper.run(q_g, kv_data_g, out=out_g, lse=lse_g)
+
+        start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+        end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+        for i in range(repeat):
+            start_events[i].record()
+            cascade_graph.replay()
+            end_events[i].record()
+        torch.cuda.synchronize()
+        cascade_graph_times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+        cascade_graph_median = sorted(cascade_graph_times)[len(cascade_graph_times) // 2]
+
+        results.append((skv_len, flat_graph_median, ref_graph_median, cascade_graph_median))
+
+    # Print results table
+    print(f"\n{'='*90}")
+    print(f"CUDA Graph Benchmark — Speedup vs Shared Prefix Length")
+    print(f"  unique_kv_len={unique_kv_len}, batch_size={batch_size}, num_heads={num_heads}, head_dim={head_dim}")
+    print(f"{'='*90}")
+    print(f"  {'shared_kv_len':>13}  {'Flat (ms)':>10}  {'MultiLevel (ms)':>15}  {'Fused (ms)':>10}  {'vs Multi':>8}  {'vs Flat':>8}")
+    print(f"  {'-'*13}  {'-'*10}  {'-'*15}  {'-'*10}  {'-'*8}  {'-'*8}")
+    for skv_len, flat_ms, multi_ms, fused_ms in results:
+        print(f"  {skv_len:>13}  {flat_ms:>10.4f}  {multi_ms:>15.4f}  {fused_ms:>10.4f}  {multi_ms / fused_ms:>7.2f}x  {flat_ms / fused_ms:>7.2f}x")
+    print(f"{'='*90}")
 
 
 def test_cascade_batch_attention_cuda_graph():
