@@ -1412,6 +1412,20 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
     }
   }
 
+  // [CascadeHolisticPlan] Task classification diagnostics
+  fprintf(stderr, "\n[CascadeHolisticPlan] === Task Classification ===\n");
+  fprintf(stderr, "  gqa_group_size=%u, num_levels=%u\n", gqa_group_size, num_levels);
+  for (uint32_t task = 0; task < NUM_TASKS; ++task) {
+    fprintf(stderr, "  Task %u (CTA_TILE_Q=%u): %zu requests\n",
+            task, CTA_TILE_Q_SIZES[task], idx_qo_len_vec[task].size());
+    for (auto& [level, i, qo_len] : idx_qo_len_vec[task]) {
+      int packed_qo_len = qo_len * gqa_group_size;
+      int kv_len_level = kv_len_arr_h_arr[level][i];
+      fprintf(stderr, "    level=%u req=%u qo_len=%d packed_qo_len=%d kv_len=%d\n",
+              level, i, qo_len, packed_qo_len, kv_len_level);
+    }
+  }
+
   int cluster_size = 1;
   int num_clusters = num_sm / cluster_size;
   plan_info.num_blks_x = cluster_size;
@@ -1460,6 +1474,14 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
     }
     task_kv_len_limit[task] = kv_len_limit;
     cluster_len_kv_chunk[task] = kv_len_limit;
+  }
+
+  // [CascadeHolisticPlan] KV splitting diagnostics
+  fprintf(stderr, "[CascadeHolisticPlan] === KV Splitting ===\n");
+  fprintf(stderr, "  total_kv_lens=%ld, num_clusters=%d\n", (long)total_kv_lens, num_clusters);
+  for (uint32_t task = 0; task < NUM_TASKS; ++task) {
+    fprintf(stderr, "  Task %u: kv_len_limit=%d (len_kv_chunk=%d)\n",
+            task, task_kv_len_limit[task], (int)cluster_len_kv_chunk[task]);
   }
 
   // Track task assignment for each (level, request)
@@ -1513,6 +1535,17 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
   }
   merge_indptr.push_back(running_offset);
   uint32_t partial_o_nnz = running_offset;
+
+  // [CascadeHolisticPlan] Merge/reduction diagnostics
+  fprintf(stderr, "[CascadeHolisticPlan] === Merge Layout ===\n");
+  fprintf(stderr, "  total_packed_qo_len=%u, partial_o_nnz=%u\n",
+          total_packed_qo_len, partial_o_nnz);
+  fprintf(stderr, "  merge_indptr size=%zu (partials per output row: first=%d, last=%d)\n",
+          merge_indptr.size(),
+          merge_indptr.size() > 1 ? (int)(merge_indptr[1] - merge_indptr[0]) : 0,
+          merge_indptr.size() > 1 ? (int)(merge_indptr.back() - merge_indptr[merge_indptr.size() - 2]) : 0);
+  fprintf(stderr, "  avg partials/row=%.1f\n",
+          total_packed_qo_len > 0 ? (float)partial_o_nnz / total_packed_qo_len : 0.0f);
 
   const int max_num_kv_splits = std::max(
       (int)(partial_o_nnz + 1),
@@ -1599,6 +1632,18 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
       work_indptr_vec[c + 1] = work_indptr_vec[c] + cluster_q_indptr[c].size();
     }
     int total_num_works = work_indptr_vec.back();
+    fprintf(stderr, "[CascadeHolisticPlan] Task %u: total_num_works=%d (across %d clusters)\n",
+            task, total_num_works, num_clusters);
+    // Print per-cluster work distribution (first 8 + last)
+    for (int c = 0; c < std::min(num_clusters, 8); ++c) {
+      fprintf(stderr, "    cluster[%d]: %d works\n", c,
+              (int)(work_indptr_vec[c + 1] - work_indptr_vec[c]));
+    }
+    if (num_clusters > 8) {
+      fprintf(stderr, "    ... (skipping clusters 8..%d)\n", num_clusters - 2);
+      fprintf(stderr, "    cluster[%d]: %d works\n", num_clusters - 1,
+              (int)(work_indptr_vec[num_clusters] - work_indptr_vec[num_clusters - 1]));
+    }
     if (total_num_works > max_total_num_works) {
       std::ostringstream err_msg;
       err_msg << "total_num_works " << total_num_works
