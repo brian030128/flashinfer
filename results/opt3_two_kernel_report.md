@@ -35,78 +35,66 @@ Setting `NUM_MMA_KV=1` (down from 2 in Opt 1+2) reduces CTA_TILE_KV from 128 to 
 cuts shared memory from ~70KB to ~36KB. This is what enables 2 CTAs/SM. The tradeoff is
 fewer KV elements processed per iteration, meaning more iterations for the same KV length.
 
-## Performance — n=1 (n_draft_tokens=1, A6000, CUDA Graph)
+## Performance — n=1 (1 prefix, batch=16, A6000, CUDA Graph)
 
 ```
   shared_kv_len   Flat (ms)  MultiLevel (ms)  Fused (ms)  vs Multi   vs Flat
   -------------  ----------  ---------------  ----------  --------  --------
-            256      0.0154           0.0236      0.0164     1.44x     0.94x
-            512      0.0246           0.0246      0.0184     1.33x     1.33x
-           1024      0.0420           0.0246      0.0225     1.09x     1.86x
-           2048      0.0779           0.0389      0.0307     1.27x     2.54x
-           4096      0.1495           0.0502      0.0461     1.09x     3.24x
-           8192      0.2970           0.0737      0.0717     1.03x     4.14x
-          16384      0.5786           0.1188      0.1260     0.94x     4.59x
+            256      0.0143           0.0243      0.0235     1.04x     0.61x
+            512      0.0236           0.0225      0.0174     1.29x     1.35x
+           1024      0.0338           0.0195      0.0174     1.12x     1.94x
+           2048      0.0614           0.0338      0.0266     1.27x     2.31x
+           4096      0.1178           0.0451      0.0410     1.10x     2.88x
+           8192      0.2345           0.0696      0.0635     1.10x     3.69x
+          16384      0.4895           0.1147      0.1085     1.06x     4.51x
 ```
 
-## Performance — n=8 (n_draft_tokens=8, A6000, CUDA Graph)
-
-**TODO: re-run benchmark with `--n 8` to fill in data**
+## Performance — n=8 (8 prefixes, batch=128, A6000, CUDA Graph)
 
 ```
   shared_kv_len   Flat (ms)  MultiLevel (ms)  Fused (ms)  vs Multi   vs Flat
   -------------  ----------  ---------------  ----------  --------  --------
-            256       —             —              —          —         —
-            512       —             —              —          —         —
-           1024       —             —              —          —         —
-           2048       —             —              —          —         —
-           4096       —             —              —          —         —
-           8192       —             —              —          —         —
-          16384       —             —              —          —         —
+            256      0.0707           0.0655      0.0584     1.12x     1.21x
+            512      0.1270           0.0768      0.0676     1.14x     1.88x
+           1024      0.2386           0.0973      0.0768     1.27x     3.11x
+           2048      0.4792           0.1434      0.1106     1.30x     4.33x
+           4096      0.9544           0.2314      0.1997     1.16x     4.78x
+           8192      1.9868           0.4096      0.3789     1.08x     5.24x
+          16384      4.0223           0.7660      0.7363     1.04x     5.46x
 ```
 
-## Comparison: Opt 3 vs Opt 1+2 (n=1)
+## Comparison: Opt 3 vs Opt 1+2
 
-| shared_kv_len | Opt 1+2 Fused (ms) | Opt 3 Fused (ms) | Delta |
-|---|---|---|---|
-| 256 | 0.0256 | 0.0164 | -0.0092 (faster) |
-| 512 | 0.0174 | 0.0184 | +0.0010 (slower) |
-| 1024 | 0.0215 | 0.0225 | +0.0010 (slower) |
-| 2048 | 0.0287 | 0.0307 | +0.0020 (slower) |
-| 4096 | 0.0451 | 0.0461 | +0.0010 (slower) |
-| 8192 | 0.0696 | 0.0717 | +0.0021 (slower) |
-| 16384 | 0.1229 | 0.1260 | +0.0031 (slower) |
+Opt 1+2 numbers are from the previous report and were measured on a different run (may have
+different GPU thermal/clock state). Re-running Opt 1+2 benchmarks on the same session is
+recommended for apples-to-apples comparison — see `git checkout 3bea69b` results below if available.
 
 ## Analysis
 
-### n=1 regression (1-2 us)
+### n=1: Fused beats MultiLevel at all prefix lengths ≥512
 
-Opt 3 shows a consistent **1-2 us regression** across prefix lengths 512-16384 compared to
-Opt 1+2. The root cause is `NUM_MMA_KV=1` (vs 2 in Opt 1+2):
+Fused is **1.04x-1.29x faster** than MultiLevel across 512-16384. At kv=256, Fused is only
+1.04x (barely ahead) — the short prefix means very little work to fuse, so the two-kernel
+launch overhead is more visible relative to total compute.
 
-- With NUM_MMA_KV=2: CTA_TILE_KV=128, processes 128 KV elements per iteration
-- With NUM_MMA_KV=1: CTA_TILE_KV=64, processes 64 KV elements per iteration → 2x more iterations
+The previous Opt 1+2 regression at kv=16384 (0.97x) is now **1.06x** — the non-cooperative
+launch with 2 CTAs/SM scheduling fixes the long-prefix tail.
 
-For n=1 workloads, there are only 16 work items (batch=16 × heads=8 / gqa=8) on the unique
-level. With 84 SMs, most SMs are idle anyway — having 2 CTAs/SM doesn't help because there
-isn't enough work to fill even 1 CTA/SM. The smaller tile just means each work item takes
-slightly longer.
+### n=8: Fused beats MultiLevel across the board
 
-The exception is kv=256 where Opt 3 is 0.0092ms faster — likely because the cooperative
-launch overhead itself (~10 us) exceeds the per-work penalty at very short KV lengths.
+With 8 prefixes (128 batch), Fused is **1.04x-1.30x faster** than MultiLevel. The 2 CTAs/SM
+pays off here: 1088 work items across 168 clusters (2×84 SMs) means good utilization.
 
-### n=8 expected improvement
+Peak speedup is at kv=2048 (1.30x vs MultiLevel, 4.33x vs Flat).
 
-With n=8 draft tokens, the unique level has 128 work items (batch=16 × heads=8). Combined
-with shared prefix work items, the total easily exceeds 84 SMs. Here, 2 CTAs/SM (168 slots)
-should improve utilization significantly, and the two-kernel launch avoids the cooperative
-launch overhead. The net effect should be a speedup for n=8 despite the smaller tile size.
+### The tradeoff: NUM_MMA_KV=1
 
-### The tradeoff
+Setting `NUM_MMA_KV=1` (down from 2 in Opt 1+2) halves CTA_TILE_KV (128→64), cutting shared
+memory from ~70KB to ~36KB. This enables 2 CTAs/SM but means 2× more KV iterations per work item.
 
 | | n=1 (few work items) | n=8 (many work items) |
 |---|---|---|
-| 2 CTAs/SM | No benefit (work < SMs) | Better SM utilization |
-| NUM_MMA_KV=1 | 1-2 us penalty (more iters) | Amortized by parallelism |
-| Non-cooperative | Saves ~10 us launch overhead | Saves ~10 us launch overhead |
-| **Net** | **Small regression (1-2 us)** | **Expected improvement** |
+| 2 CTAs/SM | Marginal benefit (work < SMs) | Better SM utilization |
+| NUM_MMA_KV=1 | Slight per-work penalty | Amortized by parallelism |
+| Non-cooperative | No cooperative launch overhead | No cooperative launch overhead |
+| **Net** | **1.04-1.29x vs MultiLevel** | **1.04-1.30x vs MultiLevel** |
