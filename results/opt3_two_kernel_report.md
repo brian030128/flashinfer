@@ -63,38 +63,91 @@ fewer KV elements processed per iteration, meaning more iterations for the same 
           16384      4.0223           0.7660      0.7363     1.04x     5.46x
 ```
 
-## Comparison: Opt 3 vs Opt 1+2
+## Comparison: Opt 3 vs Opt 1+2 (same-session benchmarks)
 
-Opt 1+2 numbers are from the previous report and were measured on a different run (may have
-different GPU thermal/clock state). Re-running Opt 1+2 benchmarks on the same session is
-recommended for apples-to-apples comparison — see `git checkout 3bea69b` results below if available.
+Measured by checking out `3bea69b` (Opt 1+2) and re-running on the same GPU session.
+
+### Opt 1+2 baseline (commit 3bea69b)
+
+**n=1:**
+```
+  shared_kv_len   Flat (ms)  MultiLevel (ms)  Fused (ms)  vs Multi   vs Flat
+  -------------  ----------  ---------------  ----------  --------  --------
+            256      0.0143           0.0184      0.0236     0.78x     0.61x
+            512      0.0246           0.0195      0.0143     1.36x     1.71x
+           1024      0.0338           0.0195      0.0164     1.19x     2.06x
+           2048      0.0625           0.0328      0.0236     1.39x     2.65x
+           4096      0.1116           0.0451      0.0389     1.16x     2.87x
+           8192      0.2222           0.0676      0.0625     1.08x     3.56x
+          16384      0.4792           0.1126      0.1137     0.99x     4.22x
+```
+
+**n=8:**
+```
+  shared_kv_len   Flat (ms)  MultiLevel (ms)  Fused (ms)  vs Multi   vs Flat
+  -------------  ----------  ---------------  ----------  --------  --------
+            256      0.0707           0.0655      0.0851     0.77x     0.83x
+            512      0.1260           0.0778      0.1065     0.73x     1.18x
+           1024      0.2417           0.0973      0.1495     0.65x     1.62x
+           2048      0.4598           0.1423      0.2396     0.59x     1.92x
+           4096      0.9585           0.2324      0.2857     0.81x     3.35x
+           8192      1.9825           0.4096      0.3799     1.08x     5.22x
+          16384      4.0090           0.7649      0.7363     1.04x     5.45x
+```
+
+### Head-to-head: Fused kernel timing
+
+**n=1 (1 prefix, batch=16):**
+
+| kv_len | Opt1+2 Fused | Opt3 Fused | Delta | Opt1+2 vs Multi | Opt3 vs Multi |
+|--------|-------------|------------|-------|-----------------|---------------|
+| 256 | 0.0236 | 0.0235 | -0.1μs | 0.78x | 1.04x |
+| 512 | 0.0143 | 0.0174 | +3.1μs | 1.36x | 1.29x |
+| 1024 | 0.0164 | 0.0174 | +1.0μs | 1.19x | 1.12x |
+| 2048 | 0.0236 | 0.0266 | +3.0μs | 1.39x | 1.27x |
+| 4096 | 0.0389 | 0.0410 | +2.1μs | 1.16x | 1.10x |
+| 8192 | 0.0625 | 0.0635 | +1.0μs | 1.08x | 1.10x |
+| 16384 | 0.1137 | 0.1085 | **-5.2μs** | 0.99x | **1.06x** |
+
+**n=8 (8 prefixes, batch=128):**
+
+| kv_len | Opt1+2 Fused | Opt3 Fused | Delta | Opt1+2 vs Multi | Opt3 vs Multi |
+|--------|-------------|------------|-------|-----------------|---------------|
+| 256 | 0.0851 | 0.0584 | **-26.7μs** | 0.77x | **1.12x** |
+| 512 | 0.1065 | 0.0676 | **-38.9μs** | 0.73x | **1.14x** |
+| 1024 | 0.1495 | 0.0768 | **-72.7μs** | 0.65x | **1.27x** |
+| 2048 | 0.2396 | 0.1106 | **-129.0μs** | 0.59x | **1.30x** |
+| 4096 | 0.2857 | 0.1997 | **-86.0μs** | 0.81x | **1.16x** |
+| 8192 | 0.3799 | 0.3789 | -1.0μs | 1.08x | 1.08x |
+| 16384 | 0.7363 | 0.7363 | 0.0μs | 1.04x | 1.04x |
 
 ## Analysis
 
-### n=1: Fused beats MultiLevel at all prefix lengths ≥512
+### n=1: Opt 3 trades 1-3μs mid-range for fixed 16384 regression
 
-Fused is **1.04x-1.29x faster** than MultiLevel across 512-16384. At kv=256, Fused is only
-1.04x (barely ahead) — the short prefix means very little work to fuse, so the two-kernel
-launch overhead is more visible relative to total compute.
+Opt 1+2 is faster at n=1 for kv 512-8192 by 1-3μs (NUM_MMA_KV=2 processes more KV/iter).
+But Opt 1+2 regresses at kv=16384 (0.99x vs MultiLevel) due to cooperative launch limiting
+occupancy. Opt 3 fixes this to 1.06x. Both beat MultiLevel at all kv≥512.
 
-The previous Opt 1+2 regression at kv=16384 (0.97x) is now **1.06x** — the non-cooperative
-launch with 2 CTAs/SM scheduling fixes the long-prefix tail.
+### n=8: Opt 1+2 was catastrophically bad — Opt 3 fixes it
 
-### n=8: Fused beats MultiLevel across the board
+With 128 batch (8 prefixes × 16 suffixes), Opt 1+2's cooperative launch with 1 CTA/SM
+created a severe bottleneck: **Fused was 0.59x-0.81x vs MultiLevel** for kv≤4096. The
+1088 work items couldn't fit on 84 SMs (1 CTA each), causing massive serialization.
 
-With 8 prefixes (128 batch), Fused is **1.04x-1.30x faster** than MultiLevel. The 2 CTAs/SM
-pays off here: 1088 work items across 168 clusters (2×84 SMs) means good utilization.
+Opt 3's two-kernel launch with 2 CTAs/SM (168 slots) completely fixes this:
+- kv=2048: **0.59x → 1.30x** (2.2× faster Fused time, 0.2396→0.1106ms)
+- kv=1024: **0.65x → 1.27x** (1.9× faster Fused time, 0.1495→0.0768ms)
+- kv=512: **0.73x → 1.14x** (1.6× faster Fused time, 0.1065→0.0676ms)
 
-Peak speedup is at kv=2048 (1.30x vs MultiLevel, 4.33x vs Flat).
+At kv≥8192, both Opt 1+2 and Opt 3 converge (~1.08x, 1.04x) because the work per CTA
+becomes large enough that occupancy matters less.
 
 ### The tradeoff: NUM_MMA_KV=1
 
-Setting `NUM_MMA_KV=1` (down from 2 in Opt 1+2) halves CTA_TILE_KV (128→64), cutting shared
-memory from ~70KB to ~36KB. This enables 2 CTAs/SM but means 2× more KV iterations per work item.
-
 | | n=1 (few work items) | n=8 (many work items) |
 |---|---|---|
-| 2 CTAs/SM | Marginal benefit (work < SMs) | Better SM utilization |
-| NUM_MMA_KV=1 | Slight per-work penalty | Amortized by parallelism |
-| Non-cooperative | No cooperative launch overhead | No cooperative launch overhead |
-| **Net** | **1.04-1.29x vs MultiLevel** | **1.04-1.30x vs MultiLevel** |
+| 2 CTAs/SM | Marginal (work < SMs) | Critical (1088 work items) |
+| NUM_MMA_KV=1 | 1-3μs penalty | Amortized by 2× occupancy |
+| Non-cooperative | Fixes kv=16384 regression | Fixes kv≤4096 catastrophe |
+| **Net** | **Small n=1 cost (1-3μs)** | **Massive n=8 win (up to 2.2×)** |

@@ -52,37 +52,53 @@ auto f = [](int x) {
 | 8192 | 2816 | ~17 | 4 |
 | 16384 | 5632 | 65 | 4 |
 
-## Performance (CUDA Graph benchmark, A6000, 1 prefix)
+## Performance — n=1 (1 prefix, batch=16, A6000, CUDA Graph)
 
 ```
   shared_kv_len   Flat (ms)  MultiLevel (ms)  Fused (ms)  vs Multi   vs Flat
   -------------  ----------  ---------------  ----------  --------  --------
-            256      0.0255           0.0297      0.0256     1.16x     1.00x
-            512      0.0256           0.0246      0.0174     1.41x     1.47x
-           1024      0.0420           0.0246      0.0215     1.14x     1.95x
-           2048      0.0788           0.0389      0.0287     1.36x     2.75x
-           4096      0.1495           0.0502      0.0451     1.11x     3.32x
-           8192      0.2970           0.0737      0.0696     1.06x     4.26x
-          16384      0.5786           0.1188      0.1229     0.97x     4.71x
+            256      0.0143           0.0184      0.0236     0.78x     0.61x
+            512      0.0246           0.0195      0.0143     1.36x     1.71x
+           1024      0.0338           0.0195      0.0164     1.19x     2.06x
+           2048      0.0625           0.0328      0.0236     1.39x     2.65x
+           4096      0.1116           0.0451      0.0389     1.16x     2.87x
+           8192      0.2222           0.0676      0.0625     1.08x     3.56x
+          16384      0.4792           0.1126      0.1137     0.99x     4.22x
+```
+
+## Performance — n=8 (8 prefixes, batch=128, A6000, CUDA Graph)
+
+```
+  shared_kv_len   Flat (ms)  MultiLevel (ms)  Fused (ms)  vs Multi   vs Flat
+  -------------  ----------  ---------------  ----------  --------  --------
+            256      0.0707           0.0655      0.0851     0.77x     0.83x
+            512      0.1260           0.0778      0.1065     0.73x     1.18x
+           1024      0.2417           0.0973      0.1495     0.65x     1.62x
+           2048      0.4598           0.1423      0.2396     0.59x     1.92x
+           4096      0.9585           0.2324      0.2857     0.81x     3.35x
+           8192      1.9825           0.4096      0.3799     1.08x     5.22x
+          16384      4.0090           0.7649      0.7363     1.04x     5.45x
 ```
 
 ## Analysis
 
-- **Short prefixes (256-512):** Fused is 1.16-1.41x MultiLevel. Minimal reduction overhead
-  with only 3 partials/row.
-- **Mid-range (1024-4096):** Fused is 1.11-1.36x MultiLevel. Massive improvement from
-  reducing 9 partials→3-4. The reduction overhead that was dominating before is now minimal.
-- **Long prefixes (8192-16384):** Fused is 1.06x at 8192 (4 partials), 0.97x at 16384.
-  At 16384, the tradeoff surfaces: only 3 shared chunks × 8 heads = 24 work items for the
-  shared prefix across 84 SMs — some load imbalance. But reduction overhead is much lower.
+### n=1
+- **Short prefixes (256):** Fused is 0.78x MultiLevel — regression due to cooperative launch
+  overhead dominating at very small workloads.
+- **Mid-range (512-4096):** Fused is 1.16-1.39x MultiLevel. Massive improvement from
+  reducing partials/row to 3-4.
+- **Long prefixes (8192-16384):** Fused is 1.08x at 8192, 0.99x at 16384.
+  At 16384, cooperative launch with 1 CTA/SM limits occupancy.
 
-## Target achieved
+### n=8 — critical weakness exposed
+- **kv≤4096: Fused is SLOWER than MultiLevel (0.59x-0.81x).** The cooperative launch
+  restricts to 1 CTA/SM (84 CTAs), but 1088 work items need processing — massive
+  serialization. MultiLevel's non-cooperative launch can run 2 CTAs/SM.
+- **kv≥8192:** Fused recovers (1.04-1.08x) because work per CTA is large enough that
+  occupancy matters less.
 
-Fused cascade ≥ 1.0x MultiLevel across prefix lengths 256-8192 (6 of 7 test points).
-At 16384, fused is 0.97x — essentially tied. The overall picture: **fused is 1.06-1.41x
-faster** across the practical operating range (512-8192).
+## Conclusion
 
-## Remaining opportunity
-
-The only regression is at kv=16384 (0.97x). This could be addressed by Opt 3
-(non-cooperative launch for 2 CTAs/SM), but the current results already exceed the target.
+Opt 1+2 achieves the target for n=1 (Fused ≥ 1.0x MultiLevel at kv≥512) but **fails
+badly at n=8** where the cooperative launch bottleneck causes 0.59x-0.81x regressions.
+This motivates Opt 3 (two-kernel non-cooperative launch with 2 CTAs/SM).
