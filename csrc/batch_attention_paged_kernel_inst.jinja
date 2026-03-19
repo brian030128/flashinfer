@@ -2,8 +2,15 @@
 #include "batch_attention_config.inc"
 
 namespace flashinfer {
+// NUM_MMA_KV=1: 36KB smem, 2 CTAs/SM (high occupancy path)
 template cudaError_t CascadeBatchPagedAttention<
-    /*CTA_TILE_Q=*/16, {{head_dim_qk}}, {{head_dim_vo}}, {{mask_mode}},
+    /*CTA_TILE_Q=*/16, /*NUM_MMA_KV=*/1, {{head_dim_qk}}, {{head_dim_vo}}, {{mask_mode}},
+    {{ variant_name }}, PersistentParams>(const PersistentParams params_1, const PersistentParams params_2,
+    const uint32_t num_blks_x, const uint32_t num_blks_y, const cudaStream_t stream);
+
+// NUM_MMA_KV=2: 68KB smem, 1 CTA/SM (high throughput path)
+template cudaError_t CascadeBatchPagedAttention<
+    /*CTA_TILE_Q=*/16, /*NUM_MMA_KV=*/2, {{head_dim_qk}}, {{head_dim_vo}}, {{mask_mode}},
     {{ variant_name }}, PersistentParams>(const PersistentParams params_1, const PersistentParams params_2,
     const uint32_t num_blks_x, const uint32_t num_blks_y, const cudaStream_t stream);
 };  // namespace flashinfer

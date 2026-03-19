@@ -136,10 +136,13 @@ def benchmark_cuda_graph(num_prefixes=1, warmup=50, repeat=200):
     unique_kv_len = 8
     suffixes_per_prefix = 16
     total_batch = num_prefixes * suffixes_per_prefix
-    num_heads = 8
+    # Llama 3.1 8B attention config (GQA: 32 query heads, 8 KV heads)
+    num_qo_heads = 32
+    num_kv_heads = 8
     head_dim = 128
     page_size = 16
     qo_len = 1
+    dtype = torch.bfloat16
 
     shared_kv_lens = [256, 512, 1024, 2048, 4096, 8192, 16384]
     results = []
@@ -155,10 +158,10 @@ def benchmark_cuda_graph(num_prefixes=1, warmup=50, repeat=200):
             unique_kv_len_tensor,
         ) = build_multi_prefix_kv_cache(
             skv_len, unique_kv_len, num_prefixes, suffixes_per_prefix,
-            num_heads, head_dim, page_size,
+            num_kv_heads, head_dim, page_size, dtype=dtype,
         )
 
-        q = torch.randn(total_batch * qo_len, num_heads, head_dim, device="cuda", dtype=torch.float16)
+        q = torch.randn(total_batch * qo_len, num_qo_heads, head_dim, device="cuda", dtype=dtype)
 
         num_shared_pages_per_prefix = ceil_div(skv_len, page_size)
         num_unique_pages = ceil_div(unique_kv_len, page_size)
@@ -190,8 +193,8 @@ def benchmark_cuda_graph(num_prefixes=1, warmup=50, repeat=200):
         )
         flat_decode.plan(
             flat_kv_indptr, flat_kv_indices, flat_last_page_len,
-            num_heads, num_heads, head_dim, page_size,
-            data_type=torch.float16,
+            num_qo_heads, num_kv_heads, head_dim, page_size,
+            q_data_type=dtype,
         )
 
         for _ in range(warmup):
@@ -229,8 +232,9 @@ def benchmark_cuda_graph(num_prefixes=1, warmup=50, repeat=200):
             [shared_kv_indptr, unique_kv_indptr],
             [shared_kv_indices, unique_kv_indices],
             [shared_last_page_len, unique_last_page_len],
-            num_heads, num_heads, head_dim, page_size,
+            num_qo_heads, num_kv_heads, head_dim, page_size,
             causal=True,
+            q_data_type=dtype,
         )
 
         # Print MultiLevel dispatch info
@@ -243,7 +247,7 @@ def benchmark_cuda_graph(num_prefixes=1, warmup=50, repeat=200):
             batch_sz = kv_indptr_l.shape[0] - 1
             total_qo = qo_indptr_l[-1].item()
             max_qo_per_req = max((qo_indptr_l[i+1] - qo_indptr_l[i]).item() for i in range(batch_sz))
-            packed_qo = max_qo_per_req * (num_heads // num_heads)  # gqa_ratio=1
+            packed_qo = max_qo_per_req * (num_qo_heads // num_kv_heads)  # gqa_ratio=4
             print(f"  Level {level_idx}: batch={batch_sz}, total_qo={total_qo}, "
                   f"max_qo_per_req={max_qo_per_req}, packed_qo={packed_qo}, kv_len={kv_len_l}"
                   f" → MultiLevel uses separate kernel launch (non-cooperative, can get 2 CTAs/SM)")
@@ -289,11 +293,11 @@ def benchmark_cuda_graph(num_prefixes=1, warmup=50, repeat=200):
             [shared_kv_indptr, unique_kv_indptr],
             [shared_kv_indices, unique_kv_indices],
             [shared_kv_len_tensor, unique_kv_len_tensor],
-            num_heads, num_heads, head_dim, head_dim,
+            num_qo_heads, num_kv_heads, head_dim, head_dim,
             page_size,
             causal=True,
-            q_data_type=torch.float16,
-            kv_data_type=torch.float16,
+            q_data_type=dtype,
+            kv_data_type=dtype,
         )
         print(f"  Fused: cooperative kernel → 1 CTA/SM (vs MultiLevel's potential 2 CTAs/SM)")
 
@@ -325,7 +329,7 @@ def benchmark_cuda_graph(num_prefixes=1, warmup=50, repeat=200):
     print(f"CUDA Graph Benchmark — Speedup vs Shared Prefix Length")
     print(f"  num_prefixes={num_prefixes}, suffixes_per_prefix={suffixes_per_prefix}"
           f", total_batch={total_batch}")
-    print(f"  unique_kv_len={unique_kv_len}, num_heads={num_heads}, head_dim={head_dim}")
+    print(f"  unique_kv_len={unique_kv_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}")
     print(f"{'='*90}")
     print(f"  {'shared_kv_len':>13}  {'Flat (ms)':>10}  {'MultiLevel (ms)':>15}  {'Fused (ms)':>10}  {'vs Multi':>8}  {'vs Flat':>8}")
     print(f"  {'-'*13}  {'-'*10}  {'-'*15}  {'-'*10}  {'-'*8}  {'-'*8}")

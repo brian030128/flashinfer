@@ -26,8 +26,8 @@
 
 namespace flashinfer {
 
-template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE,
-          typename AttentionVariant, typename Params>
+template <uint32_t CTA_TILE_Q, uint32_t NUM_MMA_KV_, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          MaskMode MASK_MODE, typename AttentionVariant, typename Params>
 cudaError_t CascadeBatchPagedAttention(const Params params_1, const Params params_2,
                                        const uint32_t num_blks_x, const uint32_t num_blks_y,
                                        const cudaStream_t stream);
@@ -190,9 +190,21 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
           PROFILER_PARAMS_SETTER
         }
 
-        cudaError_t status = CascadeBatchPagedAttention<16, HEAD_DIM_QK, HEAD_DIM_VO,
-                                                      MASK_MODE, AttentionVariant>(
-            params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
+        // Adaptive NUM_MMA_KV dispatch:
+        // If scheduler chose 2 CTAs/SM (num_blks_y > physical SMs), use NUM_MMA_KV=1 (36KB smem)
+        // Otherwise use NUM_MMA_KV=2 (68KB smem) for faster per-work processing
+        int num_sm = 0;
+        cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, 0);
+        cudaError_t status;
+        if (plan_info.num_blks_y > static_cast<uint32_t>(num_sm)) {
+            status = CascadeBatchPagedAttention<16, 1, HEAD_DIM_QK, HEAD_DIM_VO,
+                                                MASK_MODE, AttentionVariant>(
+                params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
+        } else {
+            status = CascadeBatchPagedAttention<16, 2, HEAD_DIM_QK, HEAD_DIM_VO,
+                                                MASK_MODE, AttentionVariant>(
+                params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
+        }
         TORCH_CHECK(status == cudaSuccess, "Failed to run persistent paged attention, error: ",
                     cudaGetErrorString(status));
         return true;

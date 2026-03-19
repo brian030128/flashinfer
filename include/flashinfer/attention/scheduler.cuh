@@ -1389,7 +1389,7 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
 
-  num_sm *= 2;  // 2 CTAs/SM with cascade two-kernel launch (smem~36KB, 2x36=72 < 100KB)
+  int num_sm_raw = num_sm;
 
   // Step 0: classify requests into Task 0 (prefill) or Task 1 (decode) based on packed_qo_len
   // Store (level, request_idx, qo_len) per task
@@ -1412,8 +1412,24 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
     }
   }
 
+  // Adaptive occupancy: count total work items (requests × kv_heads) to decide 1 vs 2 CTAs/SM
+  // NUM_MMA_KV=1 → 36KB smem → 2 CTAs/SM (high occupancy, good when many work items)
+  // NUM_MMA_KV=2 → 68KB smem → 1 CTA/SM  (high throughput per CTA, good when few work items)
+  int total_requests = 0;
+  for (uint32_t level = 0; level < num_levels; ++level)
+    total_requests += batch_size_arr[level];
+  total_requests *= num_kv_heads;
+  if (total_requests > num_sm_raw) {
+    num_sm *= 2;  // 2 CTAs/SM
+  }
+  // else: keep num_sm as-is (1 CTA/SM)
+
+  fprintf(stderr, "\n[CascadeHolisticPlan] === Adaptive Occupancy ===\n");
+  fprintf(stderr, "  total_requests=%d, num_sm_raw=%d, num_sm=%d (CTAs/SM=%s)\n",
+          total_requests, num_sm_raw, num_sm, (num_sm > num_sm_raw) ? "2" : "1");
+
   // [CascadeHolisticPlan] Task classification diagnostics
-  fprintf(stderr, "\n[CascadeHolisticPlan] === Task Classification ===\n");
+  fprintf(stderr, "[CascadeHolisticPlan] === Task Classification ===\n");
   fprintf(stderr, "  gqa_group_size=%u, num_levels=%u\n", gqa_group_size, num_levels);
   for (uint32_t task = 0; task < NUM_TASKS; ++task) {
     fprintf(stderr, "  Task %u (CTA_TILE_Q=%u): %zu requests\n",

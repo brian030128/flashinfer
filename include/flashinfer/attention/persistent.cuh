@@ -647,8 +647,8 @@ cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params pa
   return cudaSuccess;
 }
 
-template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE,
-          typename AttentionVariant, typename Params>
+template <uint32_t CTA_TILE_Q, uint32_t NUM_MMA_KV_, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          MaskMode MASK_MODE, typename AttentionVariant, typename Params>
 cudaError_t CascadeBatchPagedAttention(const Params params_1, const Params params_2,
                                        const uint32_t num_blks_x, const uint32_t num_blks_y,
                                        const cudaStream_t stream) {
@@ -659,7 +659,7 @@ cudaError_t CascadeBatchPagedAttention(const Params params_1, const Params param
   constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
   constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
-  constexpr uint32_t NUM_MMA_KV = 1;  // CTA_TILE_KV=64, smem~36KB -> 2 CTAs/SM
+  constexpr uint32_t NUM_MMA_KV = NUM_MMA_KV_;
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   using KTraits_ = KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK,
