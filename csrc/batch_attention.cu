@@ -26,11 +26,11 @@
 
 namespace flashinfer {
 
-template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
-          MaskMode MASK_MODE, typename AttentionVariant, typename Params>
-cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params params_2,
-                                          const uint32_t num_blks_x, const uint32_t num_blks_y,
-                                          const cudaStream_t stream);
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE,
+          typename AttentionVariant, typename Params>
+cudaError_t CascadeBatchPagedAttention(const Params params_1, const Params params_2,
+                                       const uint32_t num_blks_x, const uint32_t num_blks_y,
+                                       const cudaStream_t stream);
 }  // namespace flashinfer
 
 using namespace flashinfer;
@@ -190,8 +190,8 @@ void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
           PROFILER_PARAMS_SETTER
         }
 
-        cudaError_t status = BatchPagedAttentionPersistent<16, 16, HEAD_DIM_QK, HEAD_DIM_VO,
-                                                           MASK_MODE, AttentionVariant>(
+        cudaError_t status = CascadeBatchPagedAttention<16, HEAD_DIM_QK, HEAD_DIM_VO,
+                                                      MASK_MODE, AttentionVariant>(
             params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
         TORCH_CHECK(status == cudaSuccess, "Failed to run persistent paged attention, error: ",
                     cudaGetErrorString(status));

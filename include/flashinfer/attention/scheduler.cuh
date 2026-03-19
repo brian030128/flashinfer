@@ -1389,7 +1389,7 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
 
-  num_sm *= 1;
+  num_sm *= 2;  // 2 CTAs/SM with cascade two-kernel launch (smem~36KB, 2x36=72 < 100KB)
 
   // Step 0: classify requests into Task 0 (prefill) or Task 1 (decode) based on packed_qo_len
   // Store (level, request_idx, qo_len) per task
