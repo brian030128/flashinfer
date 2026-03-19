@@ -610,7 +610,7 @@ cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params pa
   constexpr uint32_t NUM_WARPS_Q_1 = get_num_warps_q(CTA_TILE_Q_1);
   constexpr uint32_t NUM_WARPS_KV_1 = get_num_warps_kv(CTA_TILE_Q_1);
   constexpr uint32_t NUM_MMA_Q_1 = get_num_mma_q(CTA_TILE_Q_1);
-  constexpr uint32_t NUM_MMA_KV_1 = 4;
+  constexpr uint32_t NUM_MMA_KV_1 = (CTA_TILE_Q_1 <= 16) ? 2 : 4;
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   using KTraits1 = KernelTraits<MASK_MODE, CTA_TILE_Q_1, NUM_MMA_Q_1, NUM_MMA_KV_1, NUM_MMA_D_QK,

@@ -1381,7 +1381,7 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
                                        uint32_t num_kv_heads, uint32_t head_dim,
                                        cudaStream_t stream) {
   constexpr uint32_t NUM_TASKS = 2;
-  const uint32_t CTA_TILE_Q_SIZES[NUM_TASKS] = {128, 16};
+  const uint32_t CTA_TILE_Q_SIZES[NUM_TASKS] = {16, 16};
   int num_sm = 0;
   int dev_id = 0;
 
@@ -1468,7 +1468,10 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
   std::vector<int> task_kv_len_limit(NUM_TASKS);
   for (uint32_t task = 0; task < NUM_TASKS; ++task) {
     int cluster_tile_q = CTA_TILE_Q_SIZES[task] * cluster_size;
-    int kv_len_limit = f(std::max(ceil_div(total_kv_lens * num_kv_heads, num_clusters), 1L));
+    // For cascade, unique level already provides ample work items (batch_size × num_kv_heads).
+    // Minimize shared prefix splitting to reduce partials/row and reduction overhead.
+    // Target at most 3 chunks per shared prefix → ≤4 partials/row.
+    int kv_len_limit = f(std::max(ceil_div(total_kv_lens, 3L), 1L));
     if (cluster_tile_q >= 64) {
       kv_len_limit /= std::min(num_kv_heads, 2U);
     }
