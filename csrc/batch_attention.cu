@@ -18,6 +18,8 @@
 #include <flashinfer/layout.cuh>
 #include <flashinfer/pos_enc.cuh>
 
+#include <memory>
+
 #include "batch_attention_config.inc"
 #include "tvm_ffi_utils.h"
 
@@ -25,12 +27,19 @@ namespace flashinfer {
 
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
+using tvm::ffi::Tensor;
 
 template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           MaskMode MASK_MODE, typename AttentionVariant, typename Params>
 cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params params_2,
                                           const uint32_t num_blks_x, const uint32_t num_blks_y,
                                           const cudaStream_t stream);
+
+template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          MaskMode MASK_MODE, typename AttentionVariant, typename Params>
+cudaError_t CascadeBatchPagedAttention(const Params params_1, const Params params_2,
+                                       const uint32_t num_blks_x, const uint32_t num_blks_y,
+                                       const cudaStream_t stream);
 }  // namespace flashinfer
 
 using namespace flashinfer;
@@ -139,6 +148,17 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].work_indptr_offset);
           params[i].len_kv_chunk = len_kv_chunk + i;
 
+          // Cascade fields
+          if (plan_info.tasks[i].cascade_num_kv_chunks_offset >= 0) {
+            params[i].cascade_num_kv_chunks_arr = GetPtrFromBaseOffset<IdType>(
+                int_buffer_ptr, plan_info.tasks[i].cascade_num_kv_chunks_offset);
+            params[i].cascade_kv_chunk_idx_arr = GetPtrFromBaseOffset<IdType>(
+                int_buffer_ptr, plan_info.tasks[i].cascade_kv_chunk_idx_offset);
+          } else {
+            params[i].cascade_num_kv_chunks_arr = nullptr;
+            params[i].cascade_kv_chunk_idx_arr = nullptr;
+          }
+
           params[i].final_o = static_cast<DTypeO*>(o.data_ptr());
           params[i].final_lse =
               maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr;
@@ -177,11 +197,78 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
           PROFILER_PARAMS_SETTER
         }
 
-        cudaError_t status = BatchPagedAttentionPersistent<128, 16, HEAD_DIM_QK, HEAD_DIM_VO,
-                                                           MASK_MODE, AttentionVariant>(
-            params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
+        cudaError_t status;
+        if (plan_info.tasks[0].cascade_num_kv_chunks_offset >= 0) {
+          status = CascadeBatchPagedAttention<64, 16, HEAD_DIM_QK, HEAD_DIM_VO,
+                                              MASK_MODE, AttentionVariant>(
+              params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
+        } else {
+          status = BatchPagedAttentionPersistent<128, 16, HEAD_DIM_QK, HEAD_DIM_VO,
+                                                 MASK_MODE, AttentionVariant>(
+              params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
+        }
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "Failed to run persistent paged attention, error: " << cudaGetErrorString(status);
         return true;
       });
+}
+
+Array<int64_t> CascadeBatchPagedAttentionPlan(
+    TensorView float_workspace_buffer,
+    TensorView int_workspace_buffer,
+    TensorView page_locked_int_workspace_buffer,
+    Array<Tensor> qo_indptr_arr,
+    Array<Tensor> kv_indptr_arr,
+    Array<Tensor> kv_len_arr,
+    Array<int64_t> causal_arr,
+    Array<int64_t> kv_indices_num_pages,
+    int64_t num_levels,
+    int64_t num_qo_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim_o) {
+  size_t float_workspace_size_in_bytes =
+      float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
+  size_t int_workspace_size_in_bytes =
+      int_workspace_buffer.size(0) * get_element_size(int_workspace_buffer);
+
+  HolisticPlanInfo<2> plan_info;
+
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
+  const cudaStream_t stream = get_stream(float_workspace_buffer.device());
+
+  std::vector<IdType*> qo_indptr_h_ptrs(num_levels);
+  std::vector<uint32_t> batch_size_arr_vec(num_levels);
+  std::vector<IdType*> kv_indptr_h_ptrs(num_levels);
+  std::vector<IdType*> kv_len_h_ptrs(num_levels);
+  std::unique_ptr<bool[]> causal_flags(new bool[num_levels]);
+  std::vector<IdType> kv_indices_level_offsets(num_levels);
+
+  IdType running_offset = 0;
+  for (int64_t l = 0; l < num_levels; ++l) {
+    qo_indptr_h_ptrs[l] = static_cast<IdType*>(qo_indptr_arr[l].data_ptr());
+    batch_size_arr_vec[l] = static_cast<uint32_t>(qo_indptr_arr[l].size(0) - 1);
+    kv_indptr_h_ptrs[l] = static_cast<IdType*>(kv_indptr_arr[l].data_ptr());
+    kv_len_h_ptrs[l] = static_cast<IdType*>(kv_len_arr[l].data_ptr());
+    causal_flags[l] = static_cast<bool>(causal_arr[l]);
+    kv_indices_level_offsets[l] = running_offset;
+    running_offset += static_cast<IdType>(kv_indices_num_pages[l]);
+  }
+
+  cudaError_t status = CascadeHolisticPlan<IdType>(
+      float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
+      int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
+      int_workspace_size_in_bytes, plan_info,
+      static_cast<uint32_t>(num_levels),
+      qo_indptr_h_ptrs.data(),
+      kv_indptr_h_ptrs.data(),
+      kv_len_h_ptrs.data(),
+      kv_indices_level_offsets.data(),
+      causal_flags.get(),
+      batch_size_arr_vec.data(),
+      num_qo_heads, num_kv_heads, head_dim_o, stream);
+
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "Failed to plan cascade persistent attention, error: " << cudaGetErrorString(status);
+
+  return Array(plan_info.ToVector());
 }

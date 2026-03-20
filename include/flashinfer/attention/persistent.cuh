@@ -270,13 +270,20 @@ struct BlockBatchPagedAttentionPersistent {
       const auto [q_indptr, kv_indptr, o_indptr, q_len, kv_len, packed_qo_start, kv_start, kv_end,
                   kv_head_idx, len_kv_chunk] = get_block_coord(params, work_idx);
 
-      const uint32_t kv_chunk_idx = kv_start / len_kv_chunk;
-      const uint32_t num_kv_chunks = ceil_div(
-          CAUSAL
-              ? min((kv_len - q_len) + ceil_div(packed_qo_start + cluster_tile_q, gqa_group_size),
-                    kv_len)
-              : kv_len,
-          len_kv_chunk);
+      // Cascade: override num_kv_chunks and kv_chunk_idx from per-work-item arrays
+      uint32_t kv_chunk_idx, num_kv_chunks;
+      if (params.cascade_num_kv_chunks_arr != nullptr) {
+        kv_chunk_idx = params.cascade_kv_chunk_idx_arr[work_idx];
+        num_kv_chunks = params.cascade_num_kv_chunks_arr[work_idx];
+      } else {
+        kv_chunk_idx = kv_start / len_kv_chunk;
+        num_kv_chunks = ceil_div(
+            CAUSAL
+                ? min((kv_len - q_len) + ceil_div(packed_qo_start + cluster_tile_q, gqa_group_size),
+                      kv_len)
+                : kv_len,
+            len_kv_chunk);
+      }
       const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * CTA_TILE_Q +
                                           get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16;
       const uint32_t qo_upperbound =
@@ -308,7 +315,10 @@ struct BlockBatchPagedAttentionPersistent {
       uint32_t block_iter_base = kv_indptr * block_size + kv_start;
       // last kv tile
       __syncthreads();
-      uint32_t packed_kv_bound = kv_indptr * block_size + kv_len;
+      // Use kv_end instead of kv_len for bounds check. This is safe because positions
+      // beyond kv_end are masked out. Using kv_end allows cascade to inflate kv_len
+      // (for disabling causal masking on non-causal levels) without invalid page access.
+      uint32_t packed_kv_bound = kv_indptr * block_size + kv_end;
 
       prefetch_offest<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
                                kv_head_idx, k_stride_page, k_stride_h, k_stride_n, block_size,
@@ -640,6 +650,74 @@ cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params pa
   void* args[] = {(void*)&params_1, (void*)&params_2};
   FLASHINFER_CUDA_CALL(
       cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  return cudaSuccess;
+}
+
+template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          MaskMode MASK_MODE, typename AttentionVariant, typename Params>
+cudaError_t CascadeBatchPagedAttention(const Params params_1, const Params params_2,
+                                       const uint32_t num_blks_x, const uint32_t num_blks_y,
+                                       const cudaStream_t stream) {
+  using DTypeQ = typename Params::DTypeQ;
+  using DTypeKV = typename Params::DTypeKV;
+  using DTypeO = typename Params::DTypeO;
+  using IdType = typename Params::IdType;
+  constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
+  constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
+
+  // Runner1 (shared prefix level — large Q tile for high KV reuse)
+  // Use NUM_MMA_KV=2 to reduce register pressure and shared memory,
+  // enabling higher occupancy in the fused kernel.
+  constexpr uint32_t NUM_WARPS_Q_1 = get_num_warps_q(CTA_TILE_Q_1);
+  constexpr uint32_t NUM_WARPS_KV_1 = get_num_warps_kv(CTA_TILE_Q_1);
+  constexpr uint32_t NUM_MMA_Q_1 = get_num_mma_q(CTA_TILE_Q_1);
+  constexpr uint32_t NUM_MMA_KV_1 = 2;
+  using KTraits1 = KernelTraits<MASK_MODE, CTA_TILE_Q_1, NUM_MMA_Q_1, NUM_MMA_KV_1, NUM_MMA_D_QK,
+                                NUM_MMA_D_VO, NUM_WARPS_Q_1, NUM_WARPS_KV_1, PosEncodingMode::kNone,
+                                DTypeQ, DTypeKV, DTypeO, float, IdType, AttentionVariant>;
+  using Runner1 = BlockBatchPagedAttentionPersistent<KTraits1, Params>;
+
+  // Runner2 (unique level — small Q tile for sparse/decode work)
+  // Use NUM_MMA_KV=1 (CTA_TILE_KV=64) to reduce shared memory from 68KB to 48KB,
+  // potentially enabling 2 CTAs/SM occupancy.
+  constexpr uint32_t NUM_WARPS_Q_2 = get_num_warps_q(CTA_TILE_Q_2);
+  constexpr uint32_t NUM_WARPS_KV_2 = get_num_warps_kv(CTA_TILE_Q_2);
+  constexpr uint32_t NUM_MMA_Q_2 = get_num_mma_q(CTA_TILE_Q_2);
+  constexpr uint32_t NUM_MMA_KV_2 = 1;
+  using KTraits2 = KernelTraits<MASK_MODE, CTA_TILE_Q_2, NUM_MMA_Q_2, NUM_MMA_KV_2, NUM_MMA_D_QK,
+                                NUM_MMA_D_VO, NUM_WARPS_Q_2, NUM_WARPS_KV_2, PosEncodingMode::kNone,
+                                DTypeQ, DTypeKV, DTypeO, float, IdType, AttentionVariant>;
+  using Runner2 = BlockBatchPagedAttentionPersistent<KTraits2, Params>;
+
+  constexpr uint32_t NUM_THREADS =
+      KTraits1::NUM_THREADS > KTraits2::NUM_THREADS ? KTraits1::NUM_THREADS : KTraits2::NUM_THREADS;
+  using ReductionKTraits =
+      StateReductionKernelTraits<HEAD_DIM_VO, 4, NUM_THREADS, DTypeO, DTypeO, IdType>;
+
+  size_t attn_smem =
+      max(sizeof(typename KTraits1::SharedStorage), sizeof(typename KTraits2::SharedStorage));
+  size_t red_smem = ReductionKTraits::SMEM_SIZE;
+
+  // Kernel 1: attention (non-cooperative launch)
+  auto attn_kernel = CascadeAttentionKernelTemplate<Runner1, Runner2>;
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, attn_smem));
+
+  dim3 nblks(num_blks_x, num_blks_y);
+  dim3 nthrs(NUM_THREADS);
+  void* attn_args[] = {(void*)&params_1, (void*)&params_2};
+  FLASHINFER_CUDA_CALL(
+      cudaLaunchKernel((void*)attn_kernel, nblks, nthrs, attn_args, attn_smem, stream));
+
+  // Kernel 2: reduction (non-cooperative, same grid)
+  auto red_kernel =
+      CascadeReductionKernelTemplate<BlockBatchReductionPersistent<ReductionKTraits>, Params>;
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(red_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, red_smem));
+  void* red_args[] = {(void*)&params_1};
+  FLASHINFER_CUDA_CALL(
+      cudaLaunchKernel((void*)red_kernel, nblks, nthrs, red_args, red_smem, stream));
+
   return cudaSuccess;
 }
 

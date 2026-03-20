@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 import math
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -197,6 +197,178 @@ class BatchAttention:
             # ADDITIONAL_FUNC_PARAMS
             # PROFILER_FUNC_PARAMS
             *profiler_args,
+        )
+
+        return out, lse
+
+
+class CascadeBatchAttentionWrapper:
+    """Fused multi-level cascade attention using two non-cooperative kernel launches.
+
+    All cascade levels are processed in one attention kernel launch, then a second
+    reduction kernel merges cross-level and cross-chunk partials.
+
+    Requires num_levels >= 2. All levels share the same Q tensor and qo_indptr.
+    Causal masking is typically applied only to the last level.
+    """
+
+    def __init__(
+        self,
+        num_levels: int,
+        kv_layout: str = "NHD",
+        device: str = "cuda",
+        use_cuda_graph: bool = False,
+        kv_indices_buffer: Optional[torch.Tensor] = None,
+    ):
+        assert num_levels >= 2, "CascadeBatchAttentionWrapper requires num_levels >= 2"
+        _check_kv_layout(kv_layout)
+        self._num_levels = num_levels
+        self._kv_layout = kv_layout
+        self._use_cuda_graph = use_cuda_graph
+
+        if use_cuda_graph:
+            if kv_indices_buffer is None:
+                raise ValueError(
+                    "kv_indices_buffer must be provided when use_cuda_graph=True"
+                )
+            self._kv_indices_buf = kv_indices_buffer
+        else:
+            self._kv_indices_buf = None
+
+        self.float_workspace_buffer = torch.empty(
+            384 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=torch.device(device),
+        )
+        self.int_workspace_buffer = torch.empty(
+            8 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=torch.device(device),
+        )
+        self.page_locked_int_workspace_buffer = torch.empty(
+            8 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=torch.device("cpu"),
+            pin_memory=True,
+        )
+
+    def plan(
+        self,
+        qo_indptr_arr: List[torch.Tensor],
+        kv_indptr_arr: List[torch.Tensor],
+        kv_indices_arr: List[torch.Tensor],
+        kv_len_arr: List[torch.Tensor],
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim_qk: int,
+        head_dim_vo: int,
+        page_size: int,
+        causal: bool = False,
+        sm_scale: Optional[float] = None,
+        logits_soft_cap: Optional[float] = None,
+        q_data_type: torch.dtype = torch.bfloat16,
+        kv_data_type: torch.dtype = torch.bfloat16,
+    ) -> None:
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+        self._logits_soft_cap = logits_soft_cap
+
+        get_module_args = (
+            q_data_type,
+            kv_data_type,
+            q_data_type,
+            kv_indptr_arr[0].dtype,
+            head_dim_qk,
+            head_dim_vo,
+            PosEncodingMode["NONE"].value,
+            logits_soft_cap > 0.0,
+            False,  # use_profiler
+        )
+        self.module = get_holistic_attention_module(*get_module_args)
+
+        qo_indptr_host_arr = [t.to("cpu", non_blocking=True) for t in qo_indptr_arr]
+        kv_indptr_host_arr = [t.to("cpu", non_blocking=True) for t in kv_indptr_arr]
+        kv_len_host_arr = [t.to("cpu", non_blocking=True) for t in kv_len_arr]
+        torch.cuda.synchronize()
+
+        self._page_size = page_size
+        self._sm_scale = sm_scale
+        self._mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
+        self._num_qo_heads = num_qo_heads
+        self._num_kv_heads = num_kv_heads
+
+        kv_indices_cat = torch.cat(kv_indices_arr, dim=0)
+        if self._use_cuda_graph:
+            if len(kv_indices_cat) > len(self._kv_indices_buf):
+                raise ValueError(
+                    f"kv_indices ({len(kv_indices_cat)}) exceeds "
+                    f"kv_indices_buffer size ({len(self._kv_indices_buf)})"
+                )
+            self._kv_indices_buf[: len(kv_indices_cat)].copy_(
+                kv_indices_cat, non_blocking=True
+            )
+            self._kv_indices = self._kv_indices_buf
+        else:
+            self._kv_indices = kv_indices_cat
+
+        causal_flags = [0] * self._num_levels
+        if causal:
+            causal_flags[-1] = 1
+
+        kv_indices_num_pages = [t.shape[0] for t in kv_indices_arr]
+
+        self._plan_info = self.module.cascade_plan(
+            self.float_workspace_buffer,
+            self.int_workspace_buffer,
+            self.page_locked_int_workspace_buffer,
+            qo_indptr_host_arr,
+            kv_indptr_host_arr,
+            kv_len_host_arr,
+            causal_flags,
+            kv_indices_num_pages,
+            self._num_levels,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_vo,
+        )
+
+    def run(
+        self,
+        q: torch.Tensor,
+        kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
+        logits_soft_cap: float = 0.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, self._kv_layout)
+        if out is None:
+            out = torch.empty_like(q)
+        if lse is None:
+            lse = torch.empty(
+                q.shape[0], q.shape[1], device=q.device, dtype=torch.float32
+            )
+        head_dim_qk = q.shape[2]
+        if self._sm_scale is None:
+            self._sm_scale = 1.0 / math.sqrt(head_dim_qk)
+
+        self.module.run(
+            self.float_workspace_buffer,
+            self.int_workspace_buffer,
+            self._plan_info,
+            q,
+            k_cache,
+            v_cache,
+            self._kv_indices,
+            out,
+            lse,
+            self._mask_mode,
+            TensorLayout[self._kv_layout].value,
+            self._num_qo_heads,
+            self._num_kv_heads,
+            self._page_size,
+            1.0,  # v_scale
+            self._sm_scale,
+            logits_soft_cap,
         )
 
         return out, lse

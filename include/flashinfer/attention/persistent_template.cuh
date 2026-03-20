@@ -95,6 +95,32 @@ __global__ __launch_bounds__(
                             params_1.merge_o_indices, smem, profiler_closure);
 #endif
 }
+
+// Two runners, no reduction — attention-only kernel for cascade two-kernel launch
+template <class BlockPersistentRunner1, class BlockPersistentRunner2>
+__global__
+    __launch_bounds__(max_threads<BlockPersistentRunner1, BlockPersistentRunner2>::value) void
+    CascadeAttentionKernelTemplate(
+        const __grid_constant__ typename BlockPersistentRunner1::Params params_1,
+        const __grid_constant__ typename BlockPersistentRunner2::Params params_2) {
+  extern __shared__ uint8_t smem[];
+  auto& smem_storage_1 =
+      reinterpret_cast<typename BlockPersistentRunner1::KTraits::SharedStorage&>(smem);
+  auto& smem_storage_2 =
+      reinterpret_cast<typename BlockPersistentRunner2::KTraits::SharedStorage&>(smem);
+  BlockPersistentRunner1::Run(params_1, &smem_storage_1);
+  BlockPersistentRunner2::Run(params_2, &smem_storage_2);
+}
+
+// Reduction-only kernel for cascade two-kernel launch
+template <class BlockReductionRunner, typename Params>
+__global__ void CascadeReductionKernelTemplate(const __grid_constant__ Params params) {
+  extern __shared__ uint8_t smem[];
+  BlockReductionRunner::Run(params.partial_o, params.final_o, params.partial_lse, params.final_lse,
+                            *(params.num_packed_qo_len), params.gqa_group_size, params.num_kv_heads,
+                            params.merge_indptr, params.merge_o_indices, smem);
+}
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_ATTENTION_PERSISTENT_TEMPLATE_CUH

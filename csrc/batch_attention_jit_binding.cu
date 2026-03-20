@@ -18,6 +18,7 @@
 
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
+using tvm::ffi::Tensor;
 
 Array<int64_t> BatchPagedAttentionPlan(TensorView float_workspace_buffer,
                                        TensorView int_workspace_buffer,
@@ -34,5 +35,20 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
                             int64_t page_size, double v_scale, double sm_scale,
                             double logits_soft_cap ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS);
 
+Array<int64_t> CascadeBatchPagedAttentionPlan(
+    TensorView float_workspace_buffer,
+    TensorView int_workspace_buffer,
+    TensorView page_locked_int_workspace_buffer,
+    Array<Tensor> qo_indptr_arr,
+    Array<Tensor> kv_indptr_arr,
+    Array<Tensor> kv_len_arr,
+    Array<int64_t> causal_arr,
+    Array<int64_t> kv_indices_num_pages,
+    int64_t num_levels,
+    int64_t num_qo_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim_o);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, &BatchPagedAttentionPlan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cascade_plan, &CascadeBatchPagedAttentionPlan);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, &BatchPagedAttentionRun);
