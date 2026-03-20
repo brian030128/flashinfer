@@ -9,7 +9,7 @@ Or just run directly for a quick sanity check:
 import argparse
 import torch
 import flashinfer
-from flashinfer.attention import CascadeBatchAttention
+from flashinfer.attention import CascadeBatchAttentionWrapper
 
 
 def ceil_div(a, b):
@@ -127,7 +127,7 @@ def run_fused(d):
     qo_indptr_unique = (
         torch.arange(d["total_batch"] + 1, device="cuda", dtype=torch.int32) * d["qo_len"]
     )
-    cascade = CascadeBatchAttention(
+    cascade = CascadeBatchAttentionWrapper(
         num_levels=2, kv_layout="NHD", device="cuda",
         use_cuda_graph=True, kv_indices_buffer=kv_indices_buffer,
     )

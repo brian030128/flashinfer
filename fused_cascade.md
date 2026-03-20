@@ -12,7 +12,7 @@ Meanwhile, the existing `TwoStageHolisticPlan` persistent kernel already runs **
 
 ## What We Built
 
-`CascadeBatchAttention` — a Python class that fuses all cascade levels into **one cooperative kernel launch**. Both the attention computation and the cross-level reduction happen inside a single `cudaLaunchCooperativeKernel`.
+`CascadeBatchAttentionWrapper` — a Python class that fuses all cascade levels into **one cooperative kernel launch**. Both the attention computation and the cross-level reduction happen inside a single `cudaLaunchCooperativeKernel`.
 
 ```
 Single cudaLaunchCooperativeKernel
@@ -99,7 +99,7 @@ Updated the `cascade_plan` declaration to match the new C++ signature.
 
 ### 7. Python API (`flashinfer/attention.py`)
 
-`CascadeBatchAttention.plan()` signature:
+`CascadeBatchAttentionWrapper.plan()` signature:
 ```python
 def plan(self,
     qo_indptr_arr: List[torch.Tensor],   # per-level QO indptr

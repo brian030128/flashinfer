@@ -188,7 +188,7 @@ class BatchAttention:
         return out, lse
 
 
-class CascadeBatchAttention:
+class CascadeBatchAttentionWrapper:
     """Fused multi-level cascade attention using a single persistent kernel.
 
     All cascade levels are processed in one cooperative kernel launch. The reduction
@@ -206,7 +206,7 @@ class CascadeBatchAttention:
         use_cuda_graph: bool = False,
         kv_indices_buffer: Optional[torch.Tensor] = None,
     ):
-        assert num_levels >= 2, "CascadeBatchAttention requires num_levels >= 2"
+        assert num_levels >= 2, "CascadeBatchAttentionWrapper requires num_levels >= 2"
         _check_kv_layout(kv_layout)
         self._num_levels = num_levels
         self._kv_layout = kv_layout

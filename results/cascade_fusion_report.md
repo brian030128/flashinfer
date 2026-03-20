@@ -6,7 +6,7 @@
 
 **The problem with separate launches:** Each kernel launch costs ~3-5us of host dispatch latency. For short sequences where compute is cheap (shared_kv_len <= 1024), this launch overhead dominates — the GPU spends more time waiting for kernels to be dispatched than doing actual math.
 
-**What fusion gives us:** `CascadeBatchAttention` packs all cascade levels into a single persistent kernel. Work items from all levels are classified by query length (packed_qo_len > 16 → Runner1/large tiles, else → Runner2/small tiles) and load-balanced across SMs. The reduction runner merges partials from both KV splits and cross-level partials using the same LSE-weighted mechanism.
+**What fusion gives us:** `CascadeBatchAttentionWrapper` packs all cascade levels into a single persistent kernel. Work items from all levels are classified by query length (packed_qo_len > 16 → Runner1/large tiles, else → Runner2/small tiles) and load-balanced across SMs. The reduction runner merges partials from both KV splits and cross-level partials using the same LSE-weighted mechanism.
 
 **Initial results (no CUDA graph):**
 

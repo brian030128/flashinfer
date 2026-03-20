@@ -1,5 +1,5 @@
 """
-CUDA Graph benchmark: CascadeBatchAttention vs MultiLevelCascadeAttentionWrapper
+CUDA Graph benchmark: CascadeBatchAttentionWrapper vs MultiLevelCascadeAttentionWrapper
 across shared prefix lengths, with N independent shared prefixes.
 
 Usage:
@@ -12,7 +12,7 @@ import argparse
 import torch
 
 import flashinfer
-from flashinfer.attention import CascadeBatchAttention
+from flashinfer.attention import CascadeBatchAttentionWrapper
 
 
 def ceil_div(a, b):
@@ -282,7 +282,7 @@ def benchmark_cuda_graph(num_prefixes=1, warmup=50, repeat=200):
             torch.arange(total_batch + 1, device="cuda", dtype=torch.int32) * qo_len
         )
 
-        cascade = CascadeBatchAttention(
+        cascade = CascadeBatchAttentionWrapper(
             num_levels=2, kv_layout="NHD", device="cuda",
             use_cuda_graph=True, kv_indices_buffer=kv_indices_buffer,
         )

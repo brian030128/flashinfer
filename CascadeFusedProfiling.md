@@ -2,7 +2,7 @@
 
 ## Setup
 
-Benchmark: `CascadeBatchAttention` (fused cooperative kernel) vs `MultiLevelCascadeAttentionWrapper` vs flat decode.
+Benchmark: `CascadeBatchAttentionWrapper` (fused cooperative kernel) vs `MultiLevelCascadeAttentionWrapper` vs flat decode.
 
 Config: n=1 prefix, 16 suffixes, qo_len=1, unique_kv_len=8, num_qo_heads=num_kv_heads=8 (GQA ratio=1), head_dim=128, page_size=16, A6000 (84 SMs).
 
