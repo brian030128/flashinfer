@@ -647,7 +647,7 @@ cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params pa
   return cudaSuccess;
 }
 
-template <uint32_t CTA_TILE_Q, uint32_t NUM_MMA_KV_, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           MaskMode MASK_MODE, typename AttentionVariant, typename Params>
 cudaError_t CascadeBatchPagedAttention(const Params params_1, const Params params_2,
                                        const uint32_t num_blks_x, const uint32_t num_blks_y,
@@ -656,28 +656,48 @@ cudaError_t CascadeBatchPagedAttention(const Params params_1, const Params param
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
   using IdType = typename Params::IdType;
-  constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
-  constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
-  constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
-  constexpr uint32_t NUM_MMA_KV = NUM_MMA_KV_;
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
-  using KTraits_ = KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK,
-                                NUM_MMA_D_VO, NUM_WARPS_Q, NUM_WARPS_KV, PosEncodingMode::kNone,
-                                DTypeQ, DTypeKV, DTypeO, float, IdType, AttentionVariant>;
-  using Runner = BlockBatchPagedAttentionPersistent<KTraits_, Params>;
 
-  constexpr uint32_t NUM_THREADS = KTraits_::NUM_THREADS;
+  // Runner1 (shared prefix level — large Q tile for high KV reuse)
+  // Use NUM_MMA_KV=2 to reduce register pressure (saves 64 regs from s_frag)
+  // and shared memory, enabling higher occupancy in the fused kernel.
+  constexpr uint32_t NUM_WARPS_Q_1 = get_num_warps_q(CTA_TILE_Q_1);
+  constexpr uint32_t NUM_WARPS_KV_1 = get_num_warps_kv(CTA_TILE_Q_1);
+  constexpr uint32_t NUM_MMA_Q_1 = get_num_mma_q(CTA_TILE_Q_1);
+  constexpr uint32_t NUM_MMA_KV_1 = 2;
+  using KTraits1 = KernelTraits<MASK_MODE, CTA_TILE_Q_1, NUM_MMA_Q_1, NUM_MMA_KV_1, NUM_MMA_D_QK,
+                                NUM_MMA_D_VO, NUM_WARPS_Q_1, NUM_WARPS_KV_1, PosEncodingMode::kNone,
+                                DTypeQ, DTypeKV, DTypeO, float, IdType, AttentionVariant>;
+  using Runner1 = BlockBatchPagedAttentionPersistent<KTraits1, Params>;
+
+  // Runner2 (unique level — small Q tile for sparse/decode work)
+  // Use NUM_MMA_KV=1 (CTA_TILE_KV=64) instead of 2 (CTA_TILE_KV=128) to reduce
+  // shared memory from 68KB to 48KB, potentially enabling 2 CTAs/SM occupancy.
+  // Task 1 items have tiny kv_len (typically ≤16), so larger KV tiles just waste loads.
+  constexpr uint32_t NUM_WARPS_Q_2 = get_num_warps_q(CTA_TILE_Q_2);
+  constexpr uint32_t NUM_WARPS_KV_2 = get_num_warps_kv(CTA_TILE_Q_2);
+  constexpr uint32_t NUM_MMA_Q_2 = get_num_mma_q(CTA_TILE_Q_2);
+  constexpr uint32_t NUM_MMA_KV_2 = 1;
+  using KTraits2 = KernelTraits<MASK_MODE, CTA_TILE_Q_2, NUM_MMA_Q_2, NUM_MMA_KV_2, NUM_MMA_D_QK,
+                                NUM_MMA_D_VO, NUM_WARPS_Q_2, NUM_WARPS_KV_2, PosEncodingMode::kNone,
+                                DTypeQ, DTypeKV, DTypeO, float, IdType, AttentionVariant>;
+  using Runner2 = BlockBatchPagedAttentionPersistent<KTraits2, Params>;
+
+  constexpr uint32_t NUM_THREADS =
+      KTraits1::NUM_THREADS > KTraits2::NUM_THREADS ? KTraits1::NUM_THREADS : KTraits2::NUM_THREADS;
   using ReductionKTraits =
       StateReductionKernelTraits<HEAD_DIM_VO, 4, NUM_THREADS, DTypeO, DTypeO, IdType>;
 
-  size_t attn_smem = sizeof(typename KTraits_::SharedStorage);
+  size_t attn_smem =
+      max(sizeof(typename KTraits1::SharedStorage), sizeof(typename KTraits2::SharedStorage));
   size_t red_smem = ReductionKTraits::SMEM_SIZE;
 
   // Kernel 1: attention (non-cooperative launch)
-  auto attn_kernel = CascadeAttentionKernelTemplate<Runner, Runner>;
+  auto attn_kernel = CascadeAttentionKernelTemplate<Runner1, Runner2>;
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, attn_smem));
+
   dim3 nblks(num_blks_x, num_blks_y);
   dim3 nthrs(NUM_THREADS);
   void* attn_args[] = {(void*)&params_1, (void*)&params_2};

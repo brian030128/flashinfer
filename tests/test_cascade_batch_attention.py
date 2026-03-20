@@ -133,7 +133,7 @@ def benchmark_cuda_graph(num_prefixes=1, warmup=50, repeat=200):
     """CUDA Graph benchmark across shared prefix lengths with N prefixes."""
     torch.manual_seed(42)
 
-    unique_kv_len = 8
+    unique_kv_len = 5
     suffixes_per_prefix = 16
     total_batch = num_prefixes * suffixes_per_prefix
     # Llama 3.1 8B attention config (GQA: 32 query heads, 8 KV heads)
@@ -217,7 +217,7 @@ def benchmark_cuda_graph(num_prefixes=1, warmup=50, repeat=200):
 
         # --- MultiLevel with CUDA Graph ---
         ref_wrapper = flashinfer.MultiLevelCascadeAttentionWrapper(
-            2, torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda"), "NHD"
+            2, torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda"), "NHD"
         )
         # Shared level: each prefix owns suffixes_per_prefix query tokens
         qo_indptr_shared_ref = (
