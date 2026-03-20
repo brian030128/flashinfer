@@ -1528,7 +1528,7 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
   uint32_t running_offset = 0;
   for (uint32_t j = 0; j < total_packed_qo_len; ++j) {
     merge_indptr.push_back(running_offset);
-    merge_o_indices.push_back(j / gqa_group_size);
+    merge_o_indices.push_back((j / gqa_group_size) * num_kv_heads * gqa_group_size + (j % gqa_group_size));
     uint32_t unpacked_pos = j / gqa_group_size;
     uint32_t total_chunks = 0;
     for (uint32_t l = 0; l < num_levels; ++l) {
