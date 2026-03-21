@@ -332,6 +332,171 @@ class CascadeBatchAttentionWrapper:
             head_dim_vo,
         )
 
+    def fast_cascade_plan(
+        self,
+        qo_indptr_host_arr: List[torch.Tensor],
+        kv_indptr_host_arr: List[torch.Tensor],
+        kv_indices_arr: List[torch.Tensor],
+        kv_len_host_arr: List[torch.Tensor],
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim_qk: int,
+        head_dim_vo: int,
+        page_size: int,
+        causal: bool = False,
+        sm_scale: Optional[float] = None,
+        logits_soft_cap: Optional[float] = None,
+        q_data_type: torch.dtype = torch.bfloat16,
+        kv_data_type: torch.dtype = torch.bfloat16,
+    ) -> None:
+        """Fast plan that skips GPU->CPU transfers and torch.cuda.synchronize().
+
+        Like plan(), but accepts pre-computed CPU tensors for qo_indptr, kv_indptr,
+        and kv_len. Requires that plan() or fast_cascade_plan() was called at least
+        once before (so self.module is cached).
+        """
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+        self._logits_soft_cap = logits_soft_cap
+
+        # Reuse self.module from prior plan() call — no get_holistic_attention_module()
+        # No GPU->CPU copy, no torch.cuda.synchronize()
+
+        self._page_size = page_size
+        self._sm_scale = sm_scale
+        self._mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
+        self._num_qo_heads = num_qo_heads
+        self._num_kv_heads = num_kv_heads
+
+        kv_indices_cat = torch.cat(kv_indices_arr, dim=0)
+        if self._use_cuda_graph:
+            if len(kv_indices_cat) > len(self._kv_indices_buf):
+                raise ValueError(
+                    f"kv_indices ({len(kv_indices_cat)}) exceeds "
+                    f"kv_indices_buffer size ({len(self._kv_indices_buf)})"
+                )
+            self._kv_indices_buf[: len(kv_indices_cat)].copy_(
+                kv_indices_cat, non_blocking=True
+            )
+            self._kv_indices = self._kv_indices_buf
+        else:
+            self._kv_indices = kv_indices_cat
+
+        causal_flags = [0] * self._num_levels
+        if causal:
+            causal_flags[-1] = 1
+
+        kv_indices_num_pages = [t.shape[0] for t in kv_indices_arr]
+
+        self._plan_info = self.module.cascade_plan(
+            self.float_workspace_buffer,
+            self.int_workspace_buffer,
+            self.page_locked_int_workspace_buffer,
+            qo_indptr_host_arr,
+            kv_indptr_host_arr,
+            kv_len_host_arr,
+            causal_flags,
+            kv_indices_num_pages,
+            self._num_levels,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_vo,
+        )
+
+    def plan_for_draft(
+        self,
+        max_draft_depth: int,
+        first_call: bool = False,
+        qo_indptr_host_arr: Optional[List[torch.Tensor]] = None,
+        kv_indptr_host_arr: Optional[List[torch.Tensor]] = None,
+        kv_indices_arr: Optional[List[torch.Tensor]] = None,
+        kv_len_host_arr: Optional[List[torch.Tensor]] = None,
+        num_qo_heads: int = 0,
+        num_kv_heads: int = 0,
+        head_dim_qk: int = 0,
+        head_dim_vo: int = 0,
+        page_size: int = 1,
+        causal: bool = False,
+        sm_scale: Optional[float] = None,
+        logits_soft_cap: Optional[float] = None,
+        q_data_type: torch.dtype = torch.bfloat16,
+        kv_data_type: torch.dtype = torch.bfloat16,
+    ) -> None:
+        """Plan once for max draft depth. Call update_draft_step() per step.
+
+        Plans cascade attention for the worst-case suffix length (max_draft_depth),
+        then identifies level-2 work items in the workspace buffer so that
+        update_draft_step() can patch kv_len/kv_end without re-running the
+        full scheduling.
+
+        Args:
+            max_draft_depth: Maximum draft suffix length (= speculative_num_steps).
+            first_call: If True, uses plan() to JIT-compile the module.
+                        If False, uses fast_cascade_plan() (no sync).
+        """
+        common = dict(
+            num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
+            page_size=page_size, causal=causal, sm_scale=sm_scale,
+            logits_soft_cap=logits_soft_cap, q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+        )
+        if first_call:
+            # plan() accepts GPU or CPU tensors (CPU is a no-op for .to("cpu"))
+            self.plan(
+                qo_indptr_arr=qo_indptr_host_arr,
+                kv_indptr_arr=kv_indptr_host_arr,
+                kv_indices_arr=kv_indices_arr,
+                kv_len_arr=kv_len_host_arr,
+                **common,
+            )
+        else:
+            self.fast_cascade_plan(
+                qo_indptr_host_arr=qo_indptr_host_arr,
+                kv_indptr_host_arr=kv_indptr_host_arr,
+                kv_indices_arr=kv_indices_arr,
+                kv_len_host_arr=kv_len_host_arr,
+                **common,
+            )
+
+        # Extract byte offsets for task 1 (decode-like) arrays.
+        # plan_info layout: [num_blks_x, num_blks_y, task0(12 fields), task1(12 fields), shared(6)]
+        # Task 1 starts at index 14. Fields: q_indptr(0), kv_indptr(1), partial_indptr(2),
+        # q_len(3), kv_len(4), q_start(5), kv_start(6), kv_end(7), kv_head_idx(8), work_indptr(9)
+        TASK1_BASE = 2 + 12  # = 14
+        kv_len_byte_offset = self._plan_info[TASK1_BASE + 4]
+        kv_end_byte_offset = self._plan_info[TASK1_BASE + 7]
+        work_indptr_byte_offset = self._plan_info[TASK1_BASE + 9]
+
+        self._draft_kv_len_start = kv_len_byte_offset // 4  # int32 index
+        self._draft_kv_end_start = kv_end_byte_offset // 4
+
+        # Get total number of work items in task 1 from work_indptr (last entry).
+        # work_indptr has num_clusters+1 entries; the last one is total_num_works.
+        buf = self.int_workspace_buffer.view(torch.int32)
+        num_clusters = self._plan_info[1]  # num_blks_y = num_clusters
+        work_indptr_start = work_indptr_byte_offset // 4
+        total_works = buf[work_indptr_start + num_clusters].item()
+
+        # For draft decode with GQA, level-1 (shared prefix) items have large
+        # packed_qo_len and go to task 0. Task 1 contains ONLY level-2 items.
+        # So all work items in task 1 are level-2 — patch all of them.
+        self._draft_level2_indices = torch.arange(
+            total_works, dtype=torch.int64, device=buf.device
+        )
+
+    def update_draft_step(self, step_kv_len: int, step_kv_end: int) -> None:
+        """Patch kv_len and kv_end for level-2 work items. No scheduling recomputation.
+
+        Args:
+            step_kv_len: kv_len_for_work for this step (= step_offset + qo_len).
+            step_kv_end: effective_kv_len for this step (= step_offset).
+        """
+        buf = self.int_workspace_buffer.view(torch.int32)
+        idx = self._draft_level2_indices
+        buf[self._draft_kv_len_start + idx] = step_kv_len
+        buf[self._draft_kv_end_start + idx] = step_kv_end
+
     def run(
         self,
         q: torch.Tensor,
