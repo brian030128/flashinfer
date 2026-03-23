@@ -488,10 +488,15 @@ class CascadeBatchAttentionWrapper:
     def update_draft_step(self, step_kv_len: int, step_kv_end: int) -> None:
         """Patch kv_len and kv_end for level-2 work items. No scheduling recomputation.
 
+        In CUDA graph mode each step has its own wrapper with exact plan data,
+        so _draft_level2_indices is not set — skip patching.
+
         Args:
             step_kv_len: kv_len_for_work for this step (= step_offset + qo_len).
             step_kv_end: effective_kv_len for this step (= step_offset).
         """
+        if not hasattr(self, "_draft_level2_indices"):
+            return
         buf = self.int_workspace_buffer.view(torch.int32)
         idx = self._draft_level2_indices
         buf[self._draft_kv_len_start + idx] = step_kv_len
