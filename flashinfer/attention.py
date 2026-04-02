@@ -460,29 +460,39 @@ class CascadeBatchAttentionWrapper:
             )
 
         # Extract byte offsets for task 1 (decode-like) arrays.
-        # plan_info layout: [num_blks_x, num_blks_y, task0(12 fields), task1(12 fields), shared(6)]
-        # Task 1 starts at index 14. Fields: q_indptr(0), kv_indptr(1), partial_indptr(2),
-        # q_len(3), kv_len(4), q_start(5), kv_start(6), kv_end(7), kv_head_idx(8), work_indptr(9)
+        # plan_info layout: [num_blks_x, num_blks_y, task0(12 fields), task1(12 fields), shared(8)]
+        # Task 1 starts at index 14. Fields per task (NUM_TASK_ARGS=12):
+        #   q_indptr(0), kv_indptr(1), partial_indptr(2), q_len(3), kv_len(4),
+        #   q_start(5), kv_start(6), kv_end(7), kv_head_idx(8), work_indptr(9),
+        #   cascade_num_kv_chunks(10), cascade_kv_chunk_idx(11)
         TASK1_BASE = 2 + 12  # = 14
         kv_len_byte_offset = self._plan_info[TASK1_BASE + 4]
         kv_end_byte_offset = self._plan_info[TASK1_BASE + 7]
+        kv_indptr_byte_offset = self._plan_info[TASK1_BASE + 1]
         work_indptr_byte_offset = self._plan_info[TASK1_BASE + 9]
 
         self._draft_kv_len_start = kv_len_byte_offset // 4  # int32 index
         self._draft_kv_end_start = kv_end_byte_offset // 4
 
-        # Get total number of work items in task 1 from work_indptr (last entry).
-        # work_indptr has num_clusters+1 entries; the last one is total_num_works.
-        buf = self.int_workspace_buffer.view(torch.int32)
+        # Read total_works from page-locked (CPU pinned) buffer — no GPU sync.
+        # cascade_plan writes to page_locked first, then async DMA to GPU.
+        page_locked_buf = self.page_locked_int_workspace_buffer.view(torch.int32)
         num_clusters = self._plan_info[1]  # num_blks_y = num_clusters
         work_indptr_start = work_indptr_byte_offset // 4
-        total_works = buf[work_indptr_start + num_clusters].item()
+        total_works = int(page_locked_buf[work_indptr_start + num_clusters])
 
-        # For draft decode with GQA, level-1 (shared prefix) items have large
-        # packed_qo_len and go to task 0. Task 1 contains ONLY level-2 items.
-        # So all work items in task 1 are level-2 — patch all of them.
-        self._draft_level2_indices = torch.arange(
-            total_works, dtype=torch.int64, device=buf.device
+        # Filter: only patch Level 2 (unique suffix) work items.
+        # The C++ scheduler sets kv_indptr = kv_indptr_h[level][i] + kv_indices_level_offsets[level].
+        # Level 0 offsets start at 0; Level 1 offsets start at len(kv_indices_arr[0]).
+        # So Level 2 items have kv_indptr >= level2_offset.
+        # This is critical for configs where both levels land in Task 1
+        # (e.g., topk=2, GQA=4: packed_qo_len = 8 < 16 for BOTH levels).
+        kv_indptr_start = kv_indptr_byte_offset // 4
+        work_kv_indptrs = page_locked_buf[kv_indptr_start : kv_indptr_start + total_works]
+        level2_offset = kv_indices_arr[0].shape[0]
+        level2_mask = work_kv_indptrs >= level2_offset
+        self._draft_level2_indices = torch.where(level2_mask)[0].to(
+            device=self.int_workspace_buffer.device
         )
 
     def update_draft_step(self, step_kv_len: int, step_kv_end: int) -> None:
