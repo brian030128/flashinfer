@@ -1413,7 +1413,7 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
         FLASHINFER_ERROR(err_msg.str());
       }
       int packed_qo_len = qo_len * gqa_group_size;
-      if (packed_qo_len > static_cast<int>(CTA_TILE_Q_SIZES[1])) {
+      if (packed_qo_len >= static_cast<int>(CTA_TILE_Q_SIZES[1])) {
         idx_qo_len_vec[0].push_back({level, i, qo_len});
       } else {
         idx_qo_len_vec[1].push_back({level, i, qo_len});
@@ -1421,8 +1421,9 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
     }
   }
 
-  // Non-cooperative launch: 2 CTAs/SM
-  num_sm *= 2;
+  // Non-cooperative launch: 3 CTAs/SM to improve HBM bandwidth utilization.
+  // With 128 threads and ~166 regs/thread: 3 × 128 × 166 = 63,744 ≤ 65,536 regs/SM.
+  num_sm *= 3;
 
   int cluster_size = 1;
   int num_clusters = num_sm / cluster_size;
@@ -1483,6 +1484,11 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
     int target_floor = std::max(1, num_clusters / std::max(1, total_base_entries));
     int target_chunks = (total_base_entries * target_ceil <= num_clusters)
                             ? target_ceil : target_floor;
+    // Ensure sufficient parallelism for large prefixes: cap kv_limit at 1024
+    // so each work item processes at most ~1024 KV tokens. This creates enough
+    // items per CTA to saturate HBM bandwidth on wide GPUs like H100.
+    int target_chunks_min = std::max(1, task_max_kv_len / 1024);
+    target_chunks = std::max(target_chunks, target_chunks_min);
     int kv_limit = f(std::max(task_max_kv_len / target_chunks, 1));
     task_kv_len_limit[task] = kv_limit;
     cluster_len_kv_chunk[task] = kv_limit;

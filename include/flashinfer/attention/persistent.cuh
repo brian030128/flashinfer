@@ -286,8 +286,10 @@ struct BlockBatchPagedAttentionPersistent {
       }
       const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * CTA_TILE_Q +
                                           get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16;
+      // Use the tile boundary (not the warp boundary) to prevent warps beyond
+      // CTA_TILE_Q from writing into adjacent QO tiles in multi-tile cascade.
       const uint32_t qo_upperbound =
-          min(q_len, ceil_div(qo_packed_idx_base + CTA_TILE_Q, gqa_group_size));
+          min(q_len, ceil_div(packed_qo_start + (blockIdx.x + 1) * CTA_TILE_Q, gqa_group_size));
 
       init_states<KTraits>(variant, o_frag, m, d);
 
