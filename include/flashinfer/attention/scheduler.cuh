@@ -1393,7 +1393,7 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
                                        uint32_t num_kv_heads, uint32_t head_dim,
                                        cudaStream_t stream) {
   constexpr uint32_t NUM_TASKS = 2;
-  const uint32_t CTA_TILE_Q_SIZES[NUM_TASKS] = {64, 16};
+  const uint32_t CTA_TILE_Q_SIZES[NUM_TASKS] = {128, 16};
   int num_sm = 0;
   int dev_id = 0;
 
@@ -1421,9 +1421,9 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
     }
   }
 
-  // Non-cooperative launch: 3 CTAs/SM to improve HBM bandwidth utilization.
-  // With 128 threads and ~166 regs/thread: 3 × 128 × 166 = 63,744 ≤ 65,536 regs/SM.
-  num_sm *= 3;
+  // Non-cooperative launch: 2 CTAs/SM. With CTA_TILE_Q_1=128 and NUM_MMA_KV=2,
+  // Runner1 smem is ~48KB, fitting 2 CTAs within A6000's 100KB max smem/SM.
+  num_sm *= 2;
 
   int cluster_size = 1;
   int num_clusters = num_sm / cluster_size;
@@ -1461,37 +1461,42 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
     }
   }
 
-  // Pre-compute kv_len_limit per task
+  // Pre-compute kv_len_limit per (level, task) to avoid cross-level suppression.
+  // When a task contains work from multiple levels with different KV lengths,
+  // computing one kv_limit from aggregate base_entries suppresses splitting for
+  // the level with the largest KV. Per-level computation gives each level its
+  // own target_chunks based on that level's entries and max KV.
   uint32_t total_packed_qo_len = qo_indptr_h_arr[0][batch_size_arr[0]] * gqa_group_size;
   std::vector<IdType> cluster_len_kv_chunk(NUM_TASKS, 0);
-  std::vector<int> task_kv_len_limit(NUM_TASKS);
+  std::vector<std::vector<int>> level_task_kv_limit(num_levels, std::vector<int>(NUM_TASKS, 128));
   for (uint32_t task = 0; task < NUM_TASKS; ++task) {
     int cluster_tile_q = CTA_TILE_Q_SIZES[task] * cluster_size;
-    int total_base_entries = 0;
-    int task_max_kv_len = 0;
-    for (auto& [level, i, qo_len] : idx_qo_len_vec[task]) {
-      int packed_qo_len = qo_len * gqa_group_size;
-      int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
-      total_base_entries += num_qo_tiles * num_kv_heads;
-      task_max_kv_len = std::max(task_max_kv_len, (int)kv_len_arr_h_arr[level][i]);
+    int task_max_kv_limit = 0;
+    for (uint32_t level = 0; level < num_levels; ++level) {
+      int level_base_entries = 0;
+      int level_max_kv = 0;
+      for (auto& [lvl, i, qo_len] : idx_qo_len_vec[task]) {
+        if (lvl != level) continue;
+        int packed_qo_len = qo_len * gqa_group_size;
+        int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
+        level_base_entries += num_qo_tiles * num_kv_heads;
+        level_max_kv = std::max(level_max_kv, (int)kv_len_arr_h_arr[level][i]);
+      }
+      if (level_base_entries == 0 || level_max_kv == 0) {
+        level_task_kv_limit[level][task] = 1;
+        continue;
+      }
+      int target_ceil = std::max(1, (int)ceil_div(num_clusters, level_base_entries));
+      int target_floor = std::max(1, num_clusters / std::max(1, level_base_entries));
+      int target_chunks = (level_base_entries * target_ceil <= num_clusters)
+                              ? target_ceil : target_floor;
+      int target_chunks_min = std::max(1, level_max_kv / 1024);
+      target_chunks = std::max(target_chunks, target_chunks_min);
+      int kv_limit = f(std::max(level_max_kv / target_chunks, 1));
+      level_task_kv_limit[level][task] = kv_limit;
+      task_max_kv_limit = std::max(task_max_kv_limit, kv_limit);
     }
-    if (total_base_entries == 0 || task_max_kv_len == 0) {
-      task_kv_len_limit[task] = 1;
-      cluster_len_kv_chunk[task] = 1;
-      continue;
-    }
-    int target_ceil = std::max(1, (int)ceil_div(num_clusters, total_base_entries));
-    int target_floor = std::max(1, num_clusters / std::max(1, total_base_entries));
-    int target_chunks = (total_base_entries * target_ceil <= num_clusters)
-                            ? target_ceil : target_floor;
-    // Ensure sufficient parallelism for large prefixes: cap kv_limit at 1024
-    // so each work item processes at most ~1024 KV tokens. This creates enough
-    // items per CTA to saturate HBM bandwidth on wide GPUs like H100.
-    int target_chunks_min = std::max(1, task_max_kv_len / 1024);
-    target_chunks = std::max(target_chunks, target_chunks_min);
-    int kv_limit = f(std::max(task_max_kv_len / target_chunks, 1));
-    task_kv_len_limit[task] = kv_limit;
-    cluster_len_kv_chunk[task] = kv_limit;
+    cluster_len_kv_chunk[task] = std::max(1, task_max_kv_limit);
   }
 
   // Track task assignment for each (level, request)
@@ -1512,7 +1517,7 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
     for (uint32_t i = 0; i < batch_size_arr[level]; ++i) {
       int kv_len = kv_len_arr_h_arr[level][i];
       uint32_t task = task_for_request[level][i];
-      int kv_limit = task_kv_len_limit[task];
+      int kv_limit = level_task_kv_limit[level][task];
       level_num_kv_chunks[level][i] = std::max(1u, (uint32_t)ceil_div(kv_len, kv_limit));
     }
   }
@@ -1552,7 +1557,6 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
 
   for (uint32_t task = 0; task < NUM_TASKS; ++task) {
     int cluster_tile_q = CTA_TILE_Q_SIZES[task] * cluster_size;
-    int kv_len_limit = task_kv_len_limit[task];
 
     std::vector<std::vector<IdType>> cluster_q_indptr(num_clusters),
         cluster_kv_indptr(num_clusters),
@@ -1572,6 +1576,7 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
       int kv_len_level = kv_len_arr_h_arr[level][i];
       int kv_len_for_work = causal_arr[level] ? kv_len_level : (kv_len_level + qo_len);
       IdType adjusted_kv_indptr = kv_indptr_h_arr[level][i] + kv_indices_level_offsets[level];
+      int kv_len_limit = level_task_kv_limit[level][task];
 
       uint32_t unpacked_pos = qo_indptr_h_arr[level][i];
       uint32_t level_partial_offset = 0;

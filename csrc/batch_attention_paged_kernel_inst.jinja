@@ -7,9 +7,9 @@ template cudaError_t BatchPagedAttentionPersistent<
     {{ variant_name }}, PersistentParams>(const PersistentParams params_1, const PersistentParams params_2,
     const uint32_t num_blks_x, const uint32_t num_blks_y, const cudaStream_t stream);
 
-// Cascade: Runner1 CTA_TILE_Q=64 (shared prefix), Runner2 CTA_TILE_Q=16 (unique/decode)
+// Cascade: Runner1 CTA_TILE_Q=128 (shared prefix), Runner2 CTA_TILE_Q=16 (unique/decode)
 template cudaError_t CascadeBatchPagedAttention<
-    /*CTA_TILE_Q_1=*/64, /*CTA_TILE_Q_2=*/16, {{head_dim_qk}}, {{head_dim_vo}}, {{mask_mode}},
+    /*CTA_TILE_Q_1=*/128, /*CTA_TILE_Q_2=*/16, {{head_dim_qk}}, {{head_dim_vo}}, {{mask_mode}},
     {{ variant_name }}, PersistentParams>(const PersistentParams params_1, const PersistentParams params_2,
     const uint32_t num_blks_x, const uint32_t num_blks_y, const cudaStream_t stream);
 };  // namespace flashinfer

@@ -199,7 +199,7 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
 
         cudaError_t status;
         if (plan_info.tasks[0].cascade_num_kv_chunks_offset >= 0) {
-          status = CascadeBatchPagedAttention<64, 16, HEAD_DIM_QK, HEAD_DIM_VO,
+          status = CascadeBatchPagedAttention<128, 16, HEAD_DIM_QK, HEAD_DIM_VO,
                                               MASK_MODE, AttentionVariant>(
               params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
         } else {
