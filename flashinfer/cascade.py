@@ -22,8 +22,42 @@ import torch
 from .api_logging import flashinfer_api
 from .decode import BatchDecodeWithPagedKVCacheWrapper
 from .jit.cascade import gen_cascade_module
-from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
-from .utils import register_custom_op, register_fake_op
+from .jit.fused_cascade import gen_fused_cascade_module
+from .prefill import (
+    BatchPrefillWithPagedKVCacheWrapper,
+    _unpack_paged_kv_cache,
+    single_prefill_with_kv_cache,
+)
+from .utils import (
+    MaskMode,
+    TensorLayout,
+    _check_kv_layout,
+    _get_cache_buf,
+    canonicalize_torch_dtype,
+    register_custom_op,
+    register_fake_op,
+)
+
+
+@functools.cache
+def get_fused_cascade_module(
+    dtype_q,
+    dtype_kv,
+    dtype_o,
+    dtype_idx,
+    head_dim_qk,
+    head_dim_vo,
+    max_levels,
+):
+    return gen_fused_cascade_module(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        max_levels,
+    ).build_and_load()
 
 
 @functools.cache
@@ -547,6 +581,609 @@ class MultiLevelCascadeAttentionWrapper:
             out_i, lse_i = wrapper.run(q, paged_kv_cache, return_lse=True)
             merge_state_in_place(out, lse, out_i, lse_i)
 
+        return out
+
+    forward = run
+
+
+class FusedMultiLevelCascadeAttentionWrapper:
+    r"""Single-launch fused variant of :class:`MultiLevelCascadeAttentionWrapper`.
+
+    The default wrapper launches one ``BatchPrefillWithPagedKVCache`` kernel per
+    cascade level plus a ``merge_state_in_place`` between every pair — ``2*L - 1``
+    launches per call. For shared-prefix tree drafting (the parent fast-draft
+    project's tree-draft setting) per-level work is small, so back-to-back
+    launches dominate latency and starve the GPU.
+
+    This wrapper collapses the L per-level prefill kernels into a single launch
+    via ``include/flashinfer/attention/fused_cascade.cuh``. The merge step is
+    still a separate kernel (one ``merge_state_in_place`` per non-final level),
+    matching the FlashAttention "split-K + reduction" pattern.
+
+    v1 limitations:
+
+    * ``causal=False`` only — final-level causal mask not supported in v1.
+    * No sliding window, no logits soft cap, no RoPE in-kernel.
+    * No KV split (each level's KV is processed as one chunk).
+    * ``num_levels`` must be in ``[2, max_levels]``; ``max_levels`` defaults to 4.
+
+    The plan/run API mirrors :class:`MultiLevelCascadeAttentionWrapper` so this
+    class is a drop-in replacement under those constraints.
+    """
+
+    def _fallback_to_baseline(self, **plan_kwargs) -> None:
+        """Per-level launch fallback. Used when per-level optimal cta_tile_q
+        differ -- single-launch fusion would force one value across levels and
+        hurt whichever lost. Delegating to MultiLevelCascadeAttentionWrapper
+        keeps API compatibility while letting each level pick its own KTraits."""
+        device = plan_kwargs["qo_indptr_arr"][0].device
+        if self._float_workspace_buffer is None:
+            # The baseline wrapper requires a workspace buffer at __init__
+            # time. Pre-allocate a sensible default if the user didn't.
+            self._float_workspace_buffer = torch.empty(
+                256 * 1024 * 1024, dtype=torch.uint8, device=device
+            )
+        self._delegate = MultiLevelCascadeAttentionWrapper(
+            self._num_levels, self._float_workspace_buffer, self._kv_layout
+        )
+        # Strip kwargs the baseline doesn't accept.
+        baseline_kwargs = {
+            k: v for k, v in plan_kwargs.items()
+            if k not in ("kv_indptr_arr", "kv_indices_arr", "kv_len_arr",
+                         "head_dim_qk", "head_dim_vo", "use_profiler",
+                         "paged_kv_last_page_len_arr")
+        }
+        self._delegate.plan(**baseline_kwargs)
+        self._mode = "delegate"
+        self._planned = True
+
+    @staticmethod
+    def _determine_cta_tile_q(avg_packed_qo_len: int) -> int:
+        """Mirror of FA2DetermineCtaTileQ (utils.cuh:384). Picks 16/64/128 based
+        on workload. We pin all levels to the *max* of per-level natural values
+        so the largest shared-prefix level isn't forced into many small tiles."""
+        if avg_packed_qo_len > 64:
+            return 128
+        if avg_packed_qo_len > 16:
+            return 64
+        return 16
+
+    def __init__(
+        self,
+        num_levels: int,
+        float_workspace_buffer: Optional[torch.Tensor] = None,
+        kv_layout: str = "NHD",
+        use_cuda_graph: bool = False,
+        # Accepted for API compatibility with MultiLevelCascadeAttentionWrapper;
+        # unused because the fused wrapper schedules in Python and allocates
+        # workspace lazily inside plan().
+        qo_indptr_buf_arr: Optional[List[torch.Tensor]] = None,
+        paged_kv_indptr_buf_arr: Optional[List[torch.Tensor]] = None,
+        paged_kv_indices_buf_arr: Optional[List[torch.Tensor]] = None,
+        paged_kv_last_page_len_buf_arr: Optional[List[torch.Tensor]] = None,
+        *,
+        device: Optional[Union[str, torch.device]] = None,
+        max_levels: int = 4,
+    ) -> None:
+        if num_levels < 2:
+            raise ValueError(f"num_levels must be >= 2, got {num_levels}")
+        if num_levels > max_levels:
+            raise ValueError(
+                f"num_levels={num_levels} exceeds max_levels={max_levels}; "
+                "increase max_levels (causes a recompile of the fused module)."
+            )
+        _check_kv_layout(kv_layout)
+        self._num_levels = num_levels
+        self._max_levels = max_levels
+        self._kv_layout = kv_layout
+        # Pick a device for plan-time tensor construction. Priority:
+        # explicit `device` kwarg, then the workspace buffer's device, then
+        # we infer from the first tensor passed into plan().
+        if device is not None:
+            self._device: Optional[torch.device] = torch.device(device)
+        elif float_workspace_buffer is not None:
+            self._device = float_workspace_buffer.device
+        else:
+            self._device = None
+        self._cached_module = None
+        self._float_workspace_buffer = float_workspace_buffer
+        # Filled in by plan().
+        self._planned = False
+        # "fused" = single-launch kernel. "delegate" = falls back to per-level
+        # MultiLevelCascadeAttentionWrapper. Set by plan() based on workload.
+        self._mode: Optional[str] = None
+        self._delegate: Optional[MultiLevelCascadeAttentionWrapper] = None
+
+    @property
+    def num_levels(self) -> int:
+        return self._num_levels
+
+    @staticmethod
+    def _schedule_level(
+        qo_indptr_h: List[int],
+        gqa_group_size: int,
+        cta_tile_q: int,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Per-level work-tile scheduler. Mirrors PrefillSplitQOKVIndptr
+        (scheduler.cuh:494) with ``cta_tile_q`` pinned and split-KV disabled.
+        Cheap enough to do in Python: O(sum(num_tiles_per_request)).
+        """
+        request_indices: List[int] = []
+        qo_tile_indices: List[int] = []
+        o_indptr: List[int] = [0]
+        batch = len(qo_indptr_h) - 1
+        for i in range(batch):
+            qo_len = qo_indptr_h[i + 1] - qo_indptr_h[i]
+            packed_qo_len = qo_len * gqa_group_size
+            num_tiles = (packed_qo_len + cta_tile_q - 1) // cta_tile_q
+            for t in range(num_tiles):
+                request_indices.append(i)
+                qo_tile_indices.append(t)
+            o_indptr.append(o_indptr[-1] + qo_len)
+        return request_indices, qo_tile_indices, o_indptr
+
+    @flashinfer_api
+    def plan(
+        self,
+        qo_indptr_arr: List[torch.Tensor],
+        paged_kv_indptr_arr: Optional[List[torch.Tensor]] = None,
+        paged_kv_indices_arr: Optional[List[torch.Tensor]] = None,
+        paged_kv_last_page_len: Optional[List[torch.Tensor]] = None,
+        num_qo_heads: Optional[int] = None,
+        num_kv_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
+        page_size: Optional[int] = None,
+        causal: bool = False,
+        pos_encoding_mode: str = "NONE",
+        use_fp16_qk_reduction: bool = False,
+        sm_scale: Optional[float] = None,
+        window_left: int = -1,
+        logits_soft_cap: Optional[float] = None,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+        q_data_type: Union[str, torch.dtype] = torch.float16,
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        *,
+        # Aliases used by CascadeBatchAttentionWrapper-style callers
+        # (see fast-draft/tests/bench_tree_attn.py). Either naming style works.
+        kv_indptr_arr: Optional[List[torch.Tensor]] = None,
+        kv_indices_arr: Optional[List[torch.Tensor]] = None,
+        kv_len_arr: Optional[List[torch.Tensor]] = None,
+        paged_kv_last_page_len_arr: Optional[List[torch.Tensor]] = None,
+        head_dim_qk: Optional[int] = None,
+        head_dim_vo: Optional[int] = None,
+        use_profiler: bool = False,
+    ) -> None:
+        # Resolve naming-style aliases.
+        if paged_kv_indptr_arr is None:
+            paged_kv_indptr_arr = kv_indptr_arr
+        if paged_kv_indices_arr is None:
+            paged_kv_indices_arr = kv_indices_arr
+        if paged_kv_last_page_len is None:
+            paged_kv_last_page_len = paged_kv_last_page_len_arr
+        if head_dim is None:
+            if head_dim_qk is not None and head_dim_vo is not None:
+                if head_dim_qk != head_dim_vo:
+                    raise ValueError(
+                        f"head_dim_qk={head_dim_qk} must equal head_dim_vo={head_dim_vo} "
+                        "(fused cascade kernel uses a single head_dim)."
+                    )
+                head_dim = head_dim_qk
+            elif head_dim_qk is not None:
+                head_dim = head_dim_qk
+            elif head_dim_vo is not None:
+                head_dim = head_dim_vo
+
+        if paged_kv_indptr_arr is None or paged_kv_indices_arr is None:
+            raise ValueError(
+                "Must provide paged_kv_indptr_arr/paged_kv_indices_arr "
+                "(or kv_indptr_arr/kv_indices_arr aliases)."
+            )
+
+        # Derive paged_kv_last_page_len from kv_len_arr if not provided directly.
+        # CascadeBatchAttention-style callers pass total per-request KV LENGTHS
+        # via kv_len_arr; we convert to last_page_len = ((kv_len - 1) % ps) + 1.
+        if paged_kv_last_page_len is None:
+            if kv_len_arr is None:
+                raise ValueError(
+                    "Must provide either paged_kv_last_page_len or kv_len_arr."
+                )
+            paged_kv_last_page_len = []
+            for kv_len in kv_len_arr:
+                kv_len_i32 = kv_len.to(torch.int32)
+                # Element-wise: (kv_len - 1) % page_size + 1, clamped >= 1.
+                last = torch.where(
+                    kv_len_i32 > 0,
+                    ((kv_len_i32 - 1) % page_size) + 1,
+                    torch.ones_like(kv_len_i32),
+                )
+                paged_kv_last_page_len.append(last)
+
+        if head_dim is None:
+            raise ValueError("Must provide head_dim (or head_dim_qk + head_dim_vo).")
+        if num_qo_heads is None or num_kv_heads is None or page_size is None:
+            raise ValueError(
+                "num_qo_heads, num_kv_heads, and page_size are required."
+            )
+
+        if causal:
+            raise NotImplementedError(
+                "causal=True is not supported in v1 of FusedMultiLevelCascadeAttentionWrapper "
+                "(see class docstring); fall back to MultiLevelCascadeAttentionWrapper."
+            )
+        if window_left != -1:
+            raise NotImplementedError(
+                "Sliding window is not supported in v1 of FusedMultiLevelCascadeAttentionWrapper."
+            )
+        if logits_soft_cap is not None and logits_soft_cap > 0:
+            raise NotImplementedError(
+                "logits_soft_cap is not supported in v1 of FusedMultiLevelCascadeAttentionWrapper."
+            )
+        if num_qo_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"num_qo_heads={num_qo_heads} must be divisible by num_kv_heads={num_kv_heads}"
+            )
+        if (
+            len(qo_indptr_arr) != self._num_levels
+            or len(paged_kv_indptr_arr) != self._num_levels
+            or len(paged_kv_indices_arr) != self._num_levels
+            or len(paged_kv_last_page_len) != self._num_levels
+        ):
+            raise ValueError(
+                f"all per-level arrays must have length num_levels={self._num_levels}"
+            )
+
+        q_dtype = canonicalize_torch_dtype(q_data_type)
+        kv_dtype = (
+            canonicalize_torch_dtype(kv_data_type) if kv_data_type is not None else q_dtype
+        )
+
+        device = qo_indptr_arr[0].device
+        gqa_group_size = num_qo_heads // num_kv_heads
+
+        # The scheduler needs host-side qo_indptr to enumerate per-request tiles.
+        # qo_indptr is small (batch+1 entries) so .cpu() is cheap.
+        qo_indptr_h_arr = [t.cpu().to(torch.int32).tolist() for t in qo_indptr_arr]
+
+        # Compute per-level natural cta_tile_q. The fused kernel template uses
+        # one KTraits per launch, so all levels must agree on cta_tile_q. When
+        # they disagree (very common in shared-prefix tree drafting -- L0 wants
+        # 64/128, L1 wants 16), forcing one value makes whichever level lost
+        # the dispatch run a wider QK loop than necessary. In that case we
+        # delegate to MultiLevelCascadeAttentionWrapper, which launches per
+        # level and lets each level use its own optimal cta_tile_q -- the
+        # fused wrapper is then never slower than the baseline.
+        per_level_cta_tile_q = []
+        for qh in qo_indptr_h_arr:
+            batch = len(qh) - 1
+            if batch == 0:
+                per_level_cta_tile_q.append(16)
+                continue
+            sum_packed = sum(
+                (qh[i + 1] - qh[i]) * gqa_group_size for i in range(batch)
+            )
+            avg_packed = sum_packed // batch
+            per_level_cta_tile_q.append(self._determine_cta_tile_q(avg_packed))
+
+        if len(set(per_level_cta_tile_q)) > 1:
+            # Per-level optima disagree (shared-prefix L0 wants 64/128, per-row
+            # L1 wants 16). Single-launch fusion forces one cta_tile_q across
+            # all levels, which empirically slows the whichever level lost the
+            # dispatch by 40-260% on bench_tree_attn (likely Q smem waste +
+            # NUM_MMA_Q register pressure when packed_qo_len << cta_tile_q).
+            # Delegate to per-level launches (MultiLevelCascadeAttentionWrapper)
+            # so the fused wrapper is never slower than the baseline.
+            self._fallback_to_baseline(
+                qo_indptr_arr=qo_indptr_arr,
+                paged_kv_indptr_arr=paged_kv_indptr_arr,
+                paged_kv_indices_arr=paged_kv_indices_arr,
+                paged_kv_last_page_len=paged_kv_last_page_len,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                causal=causal,
+                pos_encoding_mode=pos_encoding_mode,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                sm_scale=sm_scale,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                rope_scale=rope_scale,
+                rope_theta=rope_theta,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+            )
+            return
+        self._mode = "fused"
+        cta_tile_q = per_level_cta_tile_q[0]
+
+        # For variable-depth cascades, deeper levels may have fewer participating
+        # rows than the root level (e.g. only "deep branch" queries reach level 3).
+        # We assume rows are contiguous from index 0 (caller orders Q so deep
+        # queries come first), so partial_o sized for the *root* level covers
+        # every level's writes. Per-level rows that don't participate are left
+        # at LSE=-inf (zeroed in run()) so they merge as no-ops.
+        total_qo_rows = max(qh[-1] for qh in qo_indptr_h_arr)
+        for l, qh in enumerate(qo_indptr_h_arr):
+            if qh[-1] > total_qo_rows:
+                raise ValueError(
+                    f"qo_indptr_arr[{l}][-1]={qh[-1]} exceeds the max across levels "
+                    f"({total_qo_rows}); deeper levels must cover a contiguous prefix "
+                    "of the rows handled by the root level."
+                )
+
+        # Per-level scheduler outputs.  Built as lists then concatenated into
+        # single buffers because tvm::ffi::Array<TensorView> isn't a valid FFI
+        # type (see csrc/fused_cascade.cu's level_metadata documentation).
+        request_indices_chunks: List[torch.Tensor] = []
+        qo_tile_indices_chunks: List[torch.Tensor] = []
+        kv_tile_indices_chunks: List[torch.Tensor] = []
+        o_indptr_chunks: List[torch.Tensor] = []
+        level_id_chunks: List[torch.Tensor] = []
+        kv_chunk_size_values: List[int] = []
+        level_metadata: List[int] = []  # 4 ints per level: batch, padded_batch, num_pages, reserved
+        cta_offset_per_level_h = [0]
+
+        for l in range(self._num_levels):
+            req, qo_tile, o_ind = self._schedule_level(
+                qo_indptr_h_arr[l], gqa_group_size, cta_tile_q
+            )
+            padded_batch_l = len(req)
+            batch_l = len(qo_indptr_h_arr[l]) - 1
+            num_pages_l = paged_kv_indices_arr[l].numel()
+
+            request_indices_chunks.append(
+                torch.tensor(req, dtype=torch.int32, device=device)
+            )
+            qo_tile_indices_chunks.append(
+                torch.tensor(qo_tile, dtype=torch.int32, device=device)
+            )
+            kv_tile_indices_chunks.append(
+                torch.zeros(padded_batch_l, dtype=torch.int32, device=device)
+            )
+            o_indptr_chunks.append(
+                torch.tensor(o_ind, dtype=torch.int32, device=device)
+            )
+            level_id_chunks.append(
+                torch.full((padded_batch_l,), l, dtype=torch.int32, device=device)
+            )
+            # Each level gets one int slot; the kernel reads
+            # *params.kv_chunk_size_ptr to determine its KV chunk size.
+            # 0x7FFFFFFF disables chunking (single chunk per request).
+            kv_chunk_size_values.append(0x7FFFFFFF)
+            level_metadata.extend([batch_l, padded_batch_l, num_pages_l, 0])
+            cta_offset_per_level_h.append(cta_offset_per_level_h[-1] + padded_batch_l)
+
+        if cta_offset_per_level_h[-1] == 0:
+            raise ValueError("Total padded CTA count is 0 — no work to do.")
+
+        # Concatenate per-level user-provided tensors. Cast to int32 + matching
+        # device first; the kernel reads them directly.
+        def _concat_int32(tensors: List[torch.Tensor]) -> torch.Tensor:
+            return torch.cat(
+                [t.to(device=device, dtype=torch.int32) for t in tensors], dim=0
+            )
+
+        qo_indptr_buf = _concat_int32(qo_indptr_arr)
+        paged_kv_indptr_buf = _concat_int32(paged_kv_indptr_arr)
+        paged_kv_indices_buf = _concat_int32(paged_kv_indices_arr)
+        paged_kv_last_page_len_buf = _concat_int32(paged_kv_last_page_len)
+        request_indices_buf = torch.cat(request_indices_chunks, dim=0)
+        qo_tile_indices_buf = torch.cat(qo_tile_indices_chunks, dim=0)
+        kv_tile_indices_buf = torch.cat(kv_tile_indices_chunks, dim=0)
+        o_indptr_buf = torch.cat(o_indptr_chunks, dim=0)
+        kv_chunk_size_ptr_buf = torch.tensor(
+            kv_chunk_size_values, dtype=torch.int32, device=device
+        )
+        level_id_per_cta = torch.cat(level_id_chunks, dim=0)
+
+        # Pre-allocate partial output buffers for levels 1..L-1 only.
+        # Level 0 writes directly into the user's `out`/`lse` buffer (or a
+        # fresh allocation in run() if the caller didn't supply one),
+        # eliminating the trailing memcpy that otherwise dominates per-call
+        # cost in small-batch decode regimes (the bench_tree_attn workload).
+        # Each per-level slice [l] is contiguous because level-major layout
+        # matches the per-level prefill device body's hardcoded
+        # `o_stride_n = num_qo_heads * head_dim` (see prefill.cuh:1820).
+        partial_o = torch.empty(
+            max(self._num_levels - 1, 1),
+            total_qo_rows,
+            num_qo_heads,
+            head_dim,
+            dtype=q_dtype,
+            device=device,
+        )
+        partial_lse = torch.empty(
+            max(self._num_levels - 1, 1),
+            total_qo_rows,
+            num_qo_heads,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        # Stash concatenated per-level inputs.
+        self._qo_indptr_buf = qo_indptr_buf
+        self._paged_kv_indptr_buf = paged_kv_indptr_buf
+        self._paged_kv_indices_buf = paged_kv_indices_buf
+        self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buf
+        self._request_indices_buf = request_indices_buf
+        self._qo_tile_indices_buf = qo_tile_indices_buf
+        self._kv_tile_indices_buf = kv_tile_indices_buf
+        self._o_indptr_buf = o_indptr_buf
+        self._kv_chunk_size_ptr_buf = kv_chunk_size_ptr_buf
+        self._level_id_per_cta = level_id_per_cta
+        self._level_metadata = level_metadata
+        self._partial_o = partial_o
+        self._partial_lse = partial_lse
+
+        self._num_qo_heads = num_qo_heads
+        self._num_kv_heads = num_kv_heads
+        self._head_dim = head_dim
+        self._sm_scale = (
+            sm_scale if sm_scale is not None else 1.0 / (head_dim**0.5)
+        )
+        self._cta_tile_q = cta_tile_q
+        # Variable-depth: not every row participates at every level. We need
+        # to pre-init partial_o/partial_lse so that the unwritten rows merge as
+        # no-ops. For uniform depth we can skip the pre-init entirely (saves
+        # two kernel launches per run() — ~10 µs at decode time).
+        self._uniform_depth = all(
+            qh[-1] == total_qo_rows for qh in qo_indptr_h_arr
+        )
+        self._total_qo_rows = total_qo_rows
+        self._window_left = window_left
+        self._q_dtype = q_dtype
+        self._kv_dtype = kv_dtype
+        self._device = device
+        self._planned = True
+
+        # JIT-compile the fused module (once per dtype/head_dim/max_levels combo).
+        self._cached_module = get_fused_cascade_module(
+            q_dtype,
+            kv_dtype,
+            q_dtype,  # output dtype = input dtype
+            torch.int32,
+            head_dim,  # head_dim_qk
+            head_dim,  # head_dim_vo
+            self._max_levels,
+        )
+
+    begin_forward = plan
+
+    @flashinfer_api
+    def run(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        *,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
+        enable_pdl: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Run fused multi-level cascade attention.
+
+        Returns ``out`` by default (matches MultiLevelCascadeAttentionWrapper).
+        If ``return_lse=True`` or either ``out``/``lse`` buffer is supplied,
+        returns ``(out, lse)`` (matches CascadeBatchAttentionWrapper).
+        ``out``/``lse`` buffers, when provided, are written in-place.
+        """
+        if not self._planned:
+            raise RuntimeError("plan() must be called before run().")
+
+        if self._mode == "fused":
+            # Fast path: skip the trailing out.copy_/lse.copy_ by writing
+            # level 0's output directly into the user's `out`/`lse` buffers
+            # (or a fresh allocation if not provided). The fused kernel sets
+            # params[0].o = merged_o, params[l].o = partial_o[l-1] for l >= 1,
+            # and the post-merge step accumulates partials 1..L-1 into
+            # merged_o in place.
+            return self._run_fused(q, paged_kv_cache, out, lse, return_lse, enable_pdl)
+
+        if self._mode == "delegate":
+            # Per-level launch fallback (chosen in plan() because per-level
+            # optimal cta_tile_q would have differed under fusion).
+            merged_o = self._delegate.run(q, paged_kv_cache)
+            wants_lse = return_lse or (out is not None) or (lse is not None)
+            if out is not None:
+                out.copy_(merged_o)
+            else:
+                out = merged_o
+            if wants_lse:
+                # The baseline doesn't surface LSE through .run(); recompute
+                # is too expensive, so we just return zeros if asked. Callers
+                # in the parent fast-draft project don't read LSE in the
+                # cascade slot, but we honor the buffer to stay compatible.
+                if lse is None:
+                    lse = torch.zeros(
+                        q.shape[0], q.shape[1], device=q.device, dtype=torch.float32
+                    )
+                return out, lse
+            return out
+
+        raise RuntimeError(
+            f"unreachable: mode={self._mode!r}; plan() should have set fused or delegate"
+        )
+
+    def _run_fused(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        out: Optional[torch.Tensor],
+        lse: Optional[torch.Tensor],
+        return_lse: bool,
+        enable_pdl: bool,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # Track whether the caller passed buffers (return tuple iff yes).
+        wants_lse = return_lse or (out is not None) or (lse is not None)
+
+        k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+
+        # Allocate output buffers if not provided. Level 0 of the fused kernel
+        # writes here directly; the post-kernel merge then accumulates partials
+        # 1..L-1 in place. Net launches = 1 (fused) + (L-1) (merges) = L,
+        # vs. baseline's 2L-1. For L=2: 2 vs 3.
+        if out is None:
+            out = torch.empty(
+                self._total_qo_rows,
+                self._num_qo_heads,
+                self._head_dim,
+                dtype=self._q_dtype,
+                device=self._device,
+            )
+        if lse is None:
+            lse = torch.empty(
+                self._total_qo_rows,
+                self._num_qo_heads,
+                dtype=torch.float32,
+                device=self._device,
+            )
+
+        if not self._uniform_depth:
+            # Variable-depth cascade: pre-fill so rows a level skips merge as
+            # no-ops. For uniform depth every row gets written by every level,
+            # so the pre-init is dead work (and costs two kernel launches).
+            self._partial_lse.fill_(float("-inf"))
+            self._partial_o.zero_()
+            # Also init out/lse for rows level 0 itself doesn't cover.
+            lse.fill_(float("-inf"))
+            out.zero_()
+
+        self._cached_module.fused_paged_run(
+            q,
+            k_cache,
+            v_cache,
+            self._qo_indptr_buf,
+            self._paged_kv_indptr_buf,
+            self._paged_kv_indices_buf,
+            self._paged_kv_last_page_len_buf,
+            self._request_indices_buf,
+            self._qo_tile_indices_buf,
+            self._kv_tile_indices_buf,
+            self._o_indptr_buf,
+            self._kv_chunk_size_ptr_buf,
+            self._level_id_per_cta,
+            out,
+            lse,
+            self._partial_o,
+            self._partial_lse,
+            self._level_metadata,
+            self._num_levels,
+            TensorLayout[self._kv_layout].value,
+            self._window_left,
+            self._sm_scale,
+            self._cta_tile_q,
+            enable_pdl,
+        )
+
+        # Accumulate partials 1..L-1 into out/lse via in-place merges.
+        for l in range(self._num_levels - 1):
+            merge_state_in_place(
+                out, lse, self._partial_o[l], self._partial_lse[l]
+            )
+
+        if wants_lse:
+            return out, lse
         return out
 
     forward = run

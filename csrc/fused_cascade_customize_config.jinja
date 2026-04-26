@@ -1,0 +1,81 @@
+#pragma once
+#include <flashinfer/page.cuh>
+#include <flashinfer/math.cuh>
+#include <flashinfer/layout.cuh>
+#include <flashinfer/utils.cuh>
+#include <flashinfer/pos_enc.cuh>
+#include <flashinfer/fastdiv.cuh>
+#include <flashinfer/attention/variant_helper.cuh>
+#include <flashinfer/attention/variants.cuh>
+
+#define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant, PagedParams, ...) \
+  { \
+    constexpr auto MASK_MODE = MaskMode::kNone; \
+    constexpr auto use_custom_mask = false; \
+    using AttentionVariant = {{ variant_name }}; \
+    __VA_ARGS__(); \
+  }
+
+using namespace flashinfer;
+
+using DTypeQ = {{ dtype_q }};
+using DTypeKV = {{ dtype_kv }};
+using DTypeO = {{ dtype_o }};
+using IdType = {{ idtype }};
+constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
+constexpr int HEAD_DIM_VO = {{ head_dim_vo }};
+constexpr bool USE_FP16_QK_REDUCTION = false;
+constexpr auto USE_LOGITS_SOFT_CAP = false;
+constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
+constexpr auto USE_SLIDING_WINDOW = false;
+
+// Bound on cascade levels. Each Params is small (~200 B), so 4 of them inside
+// FusedCascadeParamsArray fit comfortably under the __grid_constant__ cap.
+constexpr uint32_t MAX_LEVELS = {{ max_levels }};
+// CTA_TILE_Q is now selected at runtime by the launcher (see DISPATCH_CTA_TILE_Q
+// in csrc/fused_cascade.cu). All levels share the same value within a launch;
+// the Python wrapper picks max(per-level natural cta_tile_q) so the largest
+// shared-prefix level isn't forced into many small tiles.
+
+struct PagedParams {
+  using DTypeQ = DTypeQ;
+  using DTypeKV = DTypeKV;
+  using DTypeO = DTypeO;
+  using IdType = IdType;
+
+  DTypeQ* q;
+  paged_kv_t<DTypeKV, IdType> paged_kv;
+  IdType* q_indptr;
+  DTypeO* o;
+  float* lse;
+  uint_fastdiv group_size;
+
+  uint32_t num_qo_heads;
+  IdType q_stride_n;
+  IdType q_stride_h;
+  int32_t window_left;
+  float logits_soft_cap;
+  float sm_scale;
+
+  IdType* request_indices;
+  IdType* qo_tile_indices;
+  IdType* kv_tile_indices;
+  IdType* merge_indptr;
+  IdType* o_indptr;
+  bool* block_valid_mask;
+  IdType* kv_chunk_size_ptr;
+  uint32_t max_total_num_rows;
+  uint32_t* total_num_rows;
+  uint32_t padded_batch_size;
+  bool partition_kv;
+
+  __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
+    return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
+  }
+
+  __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
+    return paged_kv.get_length(batch_idx);
+  }
+};
+
+{{ variant_decl }}

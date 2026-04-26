@@ -40,6 +40,9 @@ from .cascade import (
     BatchPrefillWithSharedPrefixPagedKVCacheWrapper as BatchPrefillWithSharedPrefixPagedKVCacheWrapper,
 )
 from .cascade import (
+    FusedMultiLevelCascadeAttentionWrapper as FusedMultiLevelCascadeAttentionWrapper,
+)
+from .cascade import (
     MultiLevelCascadeAttentionWrapper as MultiLevelCascadeAttentionWrapper,
 )
 from .cascade import merge_state as merge_state
