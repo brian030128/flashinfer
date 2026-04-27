@@ -868,11 +868,16 @@ class FusedMultiLevelCascadeAttentionWrapper:
         if len(set(per_level_cta_tile_q)) > 1:
             # Per-level optima disagree (shared-prefix L0 wants 64/128, per-row
             # L1 wants 16). Single-launch fusion forces one cta_tile_q across
-            # all levels, which empirically slows the whichever level lost the
-            # dispatch by 40-260% on bench_tree_attn (likely Q smem waste +
+            # all levels, which empirically slows whichever level lost the
+            # dispatch by 40-260% on bench_tree_attn (Q smem waste +
             # NUM_MMA_Q register pressure when packed_qo_len << cta_tile_q).
-            # Delegate to per-level launches (MultiLevelCascadeAttentionWrapper)
-            # so the fused wrapper is never slower than the baseline.
+            # Tried adding a per-warp early-exit in prefill.cuh's
+            # BatchPrefillWithPagedKVCacheDevice but it introduced a runtime
+            # branch that wrecked the compiler's loop unrolling /
+            # register-allocation even on the always-true path
+            # (own-bench median 6.54x -> 1.77x). Delegating to per-level
+            # launches via MultiLevelCascadeAttentionWrapper is the safer
+            # path -- never slower than the baseline.
             self._fallback_to_baseline(
                 qo_indptr_arr=qo_indptr_arr,
                 paged_kv_indptr_arr=paged_kv_indptr_arr,
