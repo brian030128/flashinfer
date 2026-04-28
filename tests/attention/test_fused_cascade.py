@@ -439,3 +439,44 @@ def test_fused_cascade_n_level_matches_baseline(num_levels, batch_size, head_dim
     fused = fused_wrapper.run(q, inputs["kv_data"])
 
     torch.testing.assert_close(fused, baseline, rtol=2e-2, atol=2e-2)
+
+
+# Mixed-pool: gqa=8 means batch=4 at L0 produces packed=32 (pool_64), while
+# L1 per-row queries produce packed=8 (pool_16). Both pool launches fire in
+# one call -- locks in the two-pool dispatch path.
+@pytest.mark.parametrize("batch_size", [4, 8])
+@pytest.mark.parametrize("shared_kv_pages", [8, 32])
+@pytest.mark.parametrize("unique_kv_pages_per_req", [1, 4])
+def test_fused_cascade_two_level_mixed_pool_gqa(
+    batch_size, shared_kv_pages, unique_kv_pages_per_req
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    device = torch.device("cuda:0")
+    kv_layout = "NHD"
+    torch.manual_seed(0)
+
+    page_size = 16
+    num_qo_heads = 8
+    num_kv_heads = 1  # gqa = 8 → forces L0 packed > 16, L1 packed ≤ 16
+    head_dim = 128
+
+    inputs = _setup_two_level_inputs(
+        batch_size,
+        shared_kv_pages,
+        unique_kv_pages_per_req,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        device,
+    )
+    q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=torch.float16, device=device)
+
+    baseline = _run_baseline(
+        inputs, q, num_qo_heads, num_kv_heads, head_dim, page_size, kv_layout
+    )
+    fused = _run_fused(
+        inputs, q, num_qo_heads, num_kv_heads, head_dim, page_size, kv_layout
+    )
+
+    torch.testing.assert_close(fused, baseline, rtol=2e-2, atol=2e-2)
