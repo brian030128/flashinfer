@@ -839,9 +839,11 @@ class FusedMultiLevelCascadeAttentionWrapper:
         device = qo_indptr_arr[0].device
         gqa_group_size = num_qo_heads // num_kv_heads
 
-        # The scheduler needs host-side qo_indptr to enumerate per-request tiles.
-        # qo_indptr is small (batch+1 entries) so .cpu() is cheap.
+        # The scheduler needs host-side qo_indptr / kv_indptr to enumerate
+        # per-request tiles and pick split-K kv_chunk_size. These tensors
+        # are tiny (batch+1 entries) so .cpu() is cheap.
         qo_indptr_h_arr = [t.cpu().to(torch.int32).tolist() for t in qo_indptr_arr]
+        kv_indptr_h_arr = [t.cpu().to(torch.int32).tolist() for t in paged_kv_indptr_arr]
 
         # For variable-depth cascades, deeper levels may have fewer participating
         # rows than the root level (e.g. only "deep branch" queries reach level 3).
@@ -874,14 +876,84 @@ class FusedMultiLevelCascadeAttentionWrapper:
                     max_packed = p
         large_cta_tile_q = 128 if max_packed > 64 else 64
 
+        # Per-level split-K decision. When a level's pool launch would have
+        # too few CTAs to saturate the GPU, we split each request's KV scan
+        # into multiple chunks -- each (req, qo_tile, kv_tile) tuple is its
+        # own CTA. After the kernel writes per-chunk partials into
+        # partial_o[l], a merge_states call folds them back to one row per
+        # query.
+        #
+        # v1 restriction: split-K is only enabled when all kv_lens at level
+        # l are equal (uniform num_chunks). That's the typical L0 case
+        # (shared prefix). Variable kv_lens at L1+ would need
+        # VariableLengthMergeStates which has no Python binding yet.
+        num_sm = torch.cuda.get_device_properties(device).multi_processor_count
+        target_ctas = num_sm  # each (req, qo_tile, kv_tile) is one block in gridDim.x
+        target_tuples = max(target_ctas // num_kv_heads, 1)
+        min_kv_chunk_tokens = max(128, page_size)
+        # Floor for activating split-K. Below this kv_len, the kernel is
+        # already cheap enough that the +1 merge_states launch (~5us) and
+        # extra CTA-launch overhead outweigh the parallelism gain. Picked to
+        # match the bench_tree_attn 1/8192 case (kv_len=8192 -> split helps,
+        # ~3x faster L0) while leaving short-prefix cases (1024 tokens etc.)
+        # alone since their unsplit kernel already runs in <30us.
+        MIN_KV_LEN_FOR_SPLIT = 2048
+        num_chunks_per_level: List[int] = []
+        kv_chunk_size_per_level: List[int] = []
+        for l in range(self._num_levels):
+            qo_h = qo_indptr_h_arr[l]
+            kv_h = kv_indptr_h_arr[l]
+            batch_l = len(qo_h) - 1
+            if batch_l == 0:
+                num_chunks_per_level.append(1)
+                kv_chunk_size_per_level.append(0x7FFFFFFF)
+                continue
+            kv_lens_pages = [kv_h[i + 1] - kv_h[i] for i in range(batch_l)]
+            kv_lens_tokens = [n * page_size for n in kv_lens_pages]
+            # v1: uniform-kv_len gate (variable kv_lens within a level would
+            # need VariableLengthMergeStates). Also short-kv gate.
+            if len(set(kv_lens_tokens)) > 1 or kv_lens_tokens[0] < MIN_KV_LEN_FOR_SPLIT:
+                num_chunks_per_level.append(1)
+                kv_chunk_size_per_level.append(0x7FFFFFFF)
+                continue
+            kv_len = kv_lens_tokens[0]
+            # Count qo_tiles across both pools (mirror _schedule_level_two_pool).
+            qo_tiles_l = 0
+            for i in range(batch_l):
+                packed = (qo_h[i + 1] - qo_h[i]) * gqa_group_size
+                if packed <= 16 or packed <= large_cta_tile_q:
+                    qo_tiles_l += 1
+                else:
+                    full = packed // large_cta_tile_q
+                    leftover = packed - full * large_cta_tile_q
+                    qo_tiles_l += full + (1 if leftover > 0 else 0)
+            if qo_tiles_l >= target_tuples:
+                # Already saturating SMs, no benefit from split-K.
+                num_chunks_per_level.append(1)
+                kv_chunk_size_per_level.append(0x7FFFFFFF)
+                continue
+            target_chunks = max(target_tuples // qo_tiles_l, 1)
+            chunk_size = max(
+                (kv_len + target_chunks - 1) // target_chunks, min_kv_chunk_tokens
+            )
+            chunk_size = ((chunk_size + page_size - 1) // page_size) * page_size
+            num_chunks = (kv_len + chunk_size - 1) // chunk_size
+            if num_chunks <= 1:
+                num_chunks_per_level.append(1)
+                kv_chunk_size_per_level.append(0x7FFFFFFF)
+                continue
+            num_chunks_per_level.append(num_chunks)
+            kv_chunk_size_per_level.append(chunk_size)
+
         # Two-pool scheduler: one set of buffers per cta_tile_q
         # (16, large_cta_tile_q). Per-pool state, indexed by
         # pool_idx ∈ {0=large pool, 1=pool_16}. Each pool gets its own
         # request_indices/qo_tile_indices/kv_tile_indices/level_id_per_cta/
         # level_metadata/kv_chunk_size_ptr concatenations. The user inputs
-        # (qo_indptr / paged_kv_*) and the per-request o_indptr are SHARED
-        # across pools because both pools reference the same problem data;
-        # only the tile schedule differs.
+        # (qo_indptr / paged_kv_*) are SHARED across pools because both
+        # pools reference the same problem data; only the tile schedule
+        # differs. The o_indptr layout is per-LEVEL but identical across
+        # pools (each level's chosen split-K decision uses one o_indptr).
         per_pool_request_chunks: List[List[torch.Tensor]] = [[], []]
         per_pool_tile_chunks: List[List[torch.Tensor]] = [[], []]
         per_pool_kv_tile_chunks: List[List[torch.Tensor]] = [[], []]
@@ -890,17 +962,50 @@ class FusedMultiLevelCascadeAttentionWrapper:
         per_pool_kv_chunk_size_values: List[List[int]] = [[], []]
         per_pool_total_ctas = [0, 0]
         o_indptr_chunks: List[torch.Tensor] = []
+        max_split_rows_per_level: List[int] = []  # for partial_o sizing
 
         for l in range(self._num_levels):
-            req_lg, tile_lg, req16, tile16, o_ind = self._schedule_level_two_pool(
-                qo_indptr_h_arr[l], gqa_group_size, large_cta_tile_q
-            )
-            batch_l = len(qo_indptr_h_arr[l]) - 1
+            qo_h = qo_indptr_h_arr[l]
+            batch_l = len(qo_h) - 1
             num_pages_l = paged_kv_indices_arr[l].numel()
+            nc = num_chunks_per_level[l]
+
+            # Build o_indptr for this level. With split-K, each request
+            # reserves qo_len * nc rows in partial_o[l] (one row per
+            # (qo_idx, chunk) pair). Without split-K, qo_len rows.
+            o_ind: List[int] = [0]
+            for i in range(batch_l):
+                qo_len = qo_h[i + 1] - qo_h[i]
+                o_ind.append(o_ind[-1] + qo_len * nc)
             o_indptr_chunks.append(
                 torch.tensor(o_ind, dtype=torch.int32, device=device)
             )
-            for pool_idx, (req, tile) in enumerate([(req_lg, tile_lg), (req16, tile16)]):
+            max_split_rows_per_level.append(o_ind[-1])  # = total_qo_rows_l * nc
+
+            req_lg, tile_lg, req16, tile16, _ = self._schedule_level_two_pool(
+                qo_h, gqa_group_size, large_cta_tile_q
+            )
+            # Expand each (req, qo_tile) into nc (req, qo_tile, kv_tile)
+            # tuples when split-K is on. The kernel reads kv_tile_idx and
+            # produces one partial output per chunk, into partial_o[l] at
+            # row (o_indptr[req] + qo_idx * nc + kv_tile_idx).
+            def _expand(reqs: List[int], tiles: List[int]):
+                if nc == 1:
+                    return reqs, tiles, [0] * len(reqs)
+                er, et, ek = [], [], []
+                for r, t in zip(reqs, tiles):
+                    for kv in range(nc):
+                        er.append(r)
+                        et.append(t)
+                        ek.append(kv)
+                return er, et, ek
+
+            req_lg, tile_lg, kv_lg = _expand(req_lg, tile_lg)
+            req16, tile16, kv16 = _expand(req16, tile16)
+
+            for pool_idx, (req, tile, kv_tile) in enumerate(
+                [(req_lg, tile_lg, kv_lg), (req16, tile16, kv16)]
+            ):
                 padded_batch_l = len(req)
                 per_pool_request_chunks[pool_idx].append(
                     torch.tensor(req, dtype=torch.int32, device=device)
@@ -909,16 +1014,20 @@ class FusedMultiLevelCascadeAttentionWrapper:
                     torch.tensor(tile, dtype=torch.int32, device=device)
                 )
                 per_pool_kv_tile_chunks[pool_idx].append(
-                    torch.zeros(padded_batch_l, dtype=torch.int32, device=device)
+                    torch.tensor(kv_tile, dtype=torch.int32, device=device)
                 )
                 per_pool_level_id_chunks[pool_idx].append(
                     torch.full(
                         (padded_batch_l,), l, dtype=torch.int32, device=device
                     )
                 )
-                per_pool_kv_chunk_size_values[pool_idx].append(0x7FFFFFFF)
+                per_pool_kv_chunk_size_values[pool_idx].append(
+                    kv_chunk_size_per_level[l]
+                )
+                # level_metadata[4*l+3] low bit = partition_kv flag.
+                partition_kv_flag = 1 if nc > 1 else 0
                 per_pool_level_metadata[pool_idx].extend(
-                    [batch_l, padded_batch_l, num_pages_l, 0]
+                    [batch_l, padded_batch_l, num_pages_l, partition_kv_flag]
                 )
                 per_pool_total_ctas[pool_idx] += padded_batch_l
 
@@ -966,12 +1075,12 @@ class FusedMultiLevelCascadeAttentionWrapper:
         # Per-level output buffers. partial_o[l] holds level l's attention
         # output (one row per query when no split-K is active for that
         # level; num_chunks rows per query when split-K is on, then folded
-        # back into the first total_qo_rows by VariableLengthMergeStates).
-        # Level-major layout matches the prefill device body's hardcoded
-        # `o_stride_n = num_qo_heads * head_dim` (see prefill.cuh:1820).
-        # Sized to total_qo_rows for now; split-K planning will grow this
-        # to max(total_qo_rows, max_split_rows_per_level) once active.
-        max_rows_per_level = total_qo_rows
+        # back into the first total_qo_rows by merge_states post-kernel).
+        # Sized to fit the largest split-K row count across levels.
+        max_rows_per_level = max(
+            total_qo_rows,
+            max(max_split_rows_per_level) if max_split_rows_per_level else 0,
+        )
         partial_o = torch.empty(
             self._num_levels,
             max_rows_per_level,
@@ -997,6 +1106,18 @@ class FusedMultiLevelCascadeAttentionWrapper:
         self._partial_o = partial_o
         self._partial_lse = partial_lse
         self._total_qo_rows_int = int(total_qo_rows)
+        # Per-level split-K plan, used by run() to merge chunks before the
+        # cross-level merge. num_chunks_per_level[l] > 1 means level l ran
+        # in split-K mode and partial_o[l, :num_chunks_l*total_qo_rows_l]
+        # holds num_chunks rows per query (organized as
+        # [request_0_qo_0_chunk_0, ..., request_0_qo_M_chunk_N, request_1_qo_0_chunk_0, ...]).
+        # The fold call: merge_states reduces shape
+        # [total_qo_rows_l, num_chunks_l, ...] -> [total_qo_rows_l, ...].
+        self._num_chunks_per_level = num_chunks_per_level
+        # qo_len_per_level[l] = sum of qo_lens of all requests in level l =
+        # total_qo_rows for that level (after split: divide partial_o[l]
+        # rows by num_chunks_l to recover this number).
+        self._qo_len_per_level = [qh[-1] for qh in qo_indptr_h_arr]
 
         # Stash per-pool scheduler outputs. Pool index 0 = large pool
         # (CTA_TILE_Q=large_cta_tile_q, picked above), pool index 1 =
@@ -1160,13 +1281,31 @@ class FusedMultiLevelCascadeAttentionWrapper:
                 enable_pdl,
             )
 
+        # Per-level split-K fold: for each level whose kernel ran in split-K
+        # mode (num_chunks > 1), the kernel wrote num_chunks partial rows
+        # per query into partial_o[l]. Reshape that contiguous block as
+        # [qo_len_l, num_chunks_l, num_qo_heads, head_dim] and call
+        # merge_states to fold chunks into one row per query, written back
+        # to partial_o[l, :qo_len_l] for the cross-level merge below.
+        for l in range(self._num_levels):
+            nc = self._num_chunks_per_level[l]
+            if nc <= 1:
+                continue
+            qo_len_l = self._qo_len_per_level[l]
+            rows = qo_len_l * nc
+            v_split = self._partial_o[l, :rows].view(
+                qo_len_l, nc, self._num_qo_heads, self._head_dim
+            )
+            s_split = self._partial_lse[l, :rows].view(
+                qo_len_l, nc, self._num_qo_heads
+            )
+            v_merged, s_merged = merge_states(v_split, s_split)
+            self._partial_o[l, :qo_len_l].copy_(v_merged)
+            self._partial_lse[l, :qo_len_l].copy_(s_merged)
+
         # Cross-level merge. partial_o[0..L-1] each hold one query row per
         # output, so just chain merge_state_in_place. Level 0 seeds out/lse;
         # levels 1..L-1 fold in.
-        # TODO(split-K): when partition_kv is active for any level, run
-        # VariableLengthMergeStates(partial_o[l] split rows) here BEFORE the
-        # cross-level merge to consolidate chunks into the first
-        # total_qo_rows of partial_o[l].
         N = self._total_qo_rows_int
         out.copy_(self._partial_o[0, :N])
         lse.copy_(self._partial_lse[0, :N])
