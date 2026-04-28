@@ -31,7 +31,16 @@ using tvm::ffi::Optional;
 //   [4*l + 0] = batch_l         (number of requests at this level)
 //   [4*l + 1] = padded_batch_l  (number of CTAs at this level)
 //   [4*l + 2] = num_pages_l     (number of paged-KV indices at this level)
-//   [4*l + 3] = (reserved, currently 0)
+//   [4*l + 3] = partition_kv flag (0 or 1). When 1, kernel uses split-K
+//               output indexing within partial_o[l]: writes go to
+//               partial_o[l] + (o_indptr[req] + kv_tile_idx) * o_stride_n.
+//               Caller runs VariableLengthMergeStates afterward to fold
+//               the chunks into the first total_qo_rows of partial_o[l].
+//
+// `partial_o` holds final / pre-merge outputs for ALL levels (one slot
+// per level, sized to cover the worst-case split-K row count). The Python
+// wrapper is responsible for combining partial_o[0..L-1] into the user's
+// `out` tensor afterward via merge_state_in_place.
 //
 // Per concatenated buffer: level l's slice is a contiguous range whose
 // per-level length is determined from `level_metadata` (e.g. for
@@ -49,10 +58,8 @@ void FusedMultiLevelCascadePagedRun(
     TensorView o_indptr_buf,                  // concat int32 [sum_l (batch_l+1)]
     TensorView kv_chunk_size_ptr_buf,         // int32 [num_levels]
     TensorView level_id_per_cta,              // int32 [total_ctas]
-    TensorView out_o,                         // [total_qo_rows, num_qo_heads, head_dim] -- level 0 writes here
-    TensorView out_lse,                       // [total_qo_rows, num_qo_heads] -- level 0 writes here
-    TensorView partial_o,                     // [num_levels-1, total_qo_rows, num_qo_heads, head_dim] -- levels 1..L-1
-    TensorView partial_lse,                   // [num_levels-1, total_qo_rows, num_qo_heads]
+    TensorView partial_o,                     // [num_levels, max_rows_per_level, num_qo_heads, head_dim]
+    TensorView partial_lse,                   // [num_levels, max_rows_per_level, num_qo_heads]
     Array<int64_t> level_metadata,
     int64_t num_levels, int64_t layout, int64_t window_left, double sm_scale,
     int64_t cta_tile_q_runtime, bool enable_pdl) {
@@ -118,6 +125,11 @@ void FusedMultiLevelCascadePagedRun(
           int64_t batch_l = level_metadata[4 * l + 0];
           int64_t padded_batch_l = level_metadata[4 * l + 1];
           int64_t num_pages_l = level_metadata[4 * l + 2];
+          // partition_kv flag from low bit of level_metadata[4*l+3]. When
+          // set, the kernel uses split-K output indexing within
+          // partial_o[l] (writes num_chunks rows per query). When unset,
+          // each query gets one row in partial_o[l].
+          bool level_partition_kv = (level_metadata[4 * l + 3] & 1) != 0;
 
           PagedParams& params = wrapped.data[l];
           params = PagedParams{};
@@ -131,17 +143,12 @@ void FusedMultiLevelCascadePagedRun(
               paged_kv_indptr_base + paged_kv_indptr_off,
               paged_kv_last_page_len_base + paged_kv_last_page_len_off);
           params.q_indptr = qo_indptr_base + qo_indptr_off;
-          // Level 0 writes directly to the caller's out / lse buffers --
-          // saves a trailing memcpy_ launch in the Python wrapper. Levels
-          // 1..L-1 land in their own slots of partial_o/partial_lse and are
-          // merged into out by the post-kernel merge_state_in_place loop.
-          if (l == 0) {
-            params.o = static_cast<DTypeO*>(out_o.data_ptr());
-            params.lse = static_cast<float*>(out_lse.data_ptr());
-          } else {
-            params.o = partial_o_ptr + (l - 1) * partial_o_stride;
-            params.lse = partial_lse_ptr + (l - 1) * partial_lse_stride;
-          }
+          // All levels write into their own slot of partial_o/partial_lse.
+          // The Python wrapper consolidates split-K chunks via
+          // VariableLengthMergeStates and then folds partial_o[0..L-1]
+          // into the user's out tensor with merge_state_in_place.
+          params.o = partial_o_ptr + l * partial_o_stride;
+          params.lse = partial_lse_ptr + l * partial_lse_stride;
           params.num_qo_heads = num_qo_heads;
           params.group_size = uint_fastdiv(num_qo_heads / num_kv_heads);
           params.q_stride_n = q.stride(0);
@@ -161,7 +168,7 @@ void FusedMultiLevelCascadePagedRun(
           params.total_num_rows = nullptr;
 
           params.padded_batch_size = static_cast<uint32_t>(padded_batch_l);
-          params.partition_kv = false;
+          params.partition_kv = level_partition_kv;
 
           total_ctas += static_cast<uint32_t>(padded_batch_l);
           wrapped.cta_offset[l + 1] = static_cast<int32_t>(total_ctas);

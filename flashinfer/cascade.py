@@ -963,25 +963,26 @@ class FusedMultiLevelCascadeAttentionWrapper:
         )
         pool_16_level_metadata = per_pool_level_metadata[1]
 
-        # Pre-allocate partial output buffers for levels 1..L-1 only.
-        # Level 0 writes directly into the user's `out`/`lse` buffer (or a
-        # fresh allocation in run() if the caller didn't supply one),
-        # eliminating the trailing memcpy that otherwise dominates per-call
-        # cost in small-batch decode regimes (the bench_tree_attn workload).
-        # Each per-level slice [l] is contiguous because level-major layout
-        # matches the per-level prefill device body's hardcoded
+        # Per-level output buffers. partial_o[l] holds level l's attention
+        # output (one row per query when no split-K is active for that
+        # level; num_chunks rows per query when split-K is on, then folded
+        # back into the first total_qo_rows by VariableLengthMergeStates).
+        # Level-major layout matches the prefill device body's hardcoded
         # `o_stride_n = num_qo_heads * head_dim` (see prefill.cuh:1820).
+        # Sized to total_qo_rows for now; split-K planning will grow this
+        # to max(total_qo_rows, max_split_rows_per_level) once active.
+        max_rows_per_level = total_qo_rows
         partial_o = torch.empty(
-            max(self._num_levels - 1, 1),
-            total_qo_rows,
+            self._num_levels,
+            max_rows_per_level,
             num_qo_heads,
             head_dim,
             dtype=q_dtype,
             device=device,
         )
         partial_lse = torch.empty(
-            max(self._num_levels - 1, 1),
-            total_qo_rows,
+            self._num_levels,
+            max_rows_per_level,
             num_qo_heads,
             dtype=torch.float32,
             device=device,
@@ -995,6 +996,7 @@ class FusedMultiLevelCascadeAttentionWrapper:
         self._o_indptr_buf = o_indptr_buf
         self._partial_o = partial_o
         self._partial_lse = partial_lse
+        self._total_qo_rows_int = int(total_qo_rows)
 
         # Stash per-pool scheduler outputs. Pool index 0 = large pool
         # (CTA_TILE_Q=large_cta_tile_q, picked above), pool index 1 =
@@ -1097,12 +1099,9 @@ class FusedMultiLevelCascadeAttentionWrapper:
         if not self._uniform_depth:
             # Variable-depth cascade: pre-fill so rows a level skips merge as
             # no-ops. For uniform depth every row gets written by every level,
-            # so the pre-init is dead work (and costs two kernel launches).
+            # so the pre-init is dead work.
             self._partial_lse.fill_(float("-inf"))
             self._partial_o.zero_()
-            # Also init out/lse for rows level 0 itself doesn't cover.
-            lse.fill_(float("-inf"))
-            out.zero_()
 
         # Two-pool dispatch: launch the large-pool kernel first (carries the
         # shared-prefix work; CTA_TILE_Q is 64 or 128 depending on the route
@@ -1125,8 +1124,6 @@ class FusedMultiLevelCascadeAttentionWrapper:
                 self._o_indptr_buf,
                 self._pool_lg_kv_chunk_size_ptr_buf,
                 self._pool_lg_level_id_per_cta,
-                out,
-                lse,
                 self._partial_o,
                 self._partial_lse,
                 self._pool_lg_level_metadata,
@@ -1152,8 +1149,6 @@ class FusedMultiLevelCascadeAttentionWrapper:
                 self._o_indptr_buf,
                 self._pool_16_kv_chunk_size_ptr_buf,
                 self._pool_16_level_id_per_cta,
-                out,
-                lse,
                 self._partial_o,
                 self._partial_lse,
                 self._pool_16_level_metadata,
@@ -1165,10 +1160,19 @@ class FusedMultiLevelCascadeAttentionWrapper:
                 enable_pdl,
             )
 
-        # Accumulate partials 1..L-1 into out/lse via in-place merges.
-        for l in range(self._num_levels - 1):
+        # Cross-level merge. partial_o[0..L-1] each hold one query row per
+        # output, so just chain merge_state_in_place. Level 0 seeds out/lse;
+        # levels 1..L-1 fold in.
+        # TODO(split-K): when partition_kv is active for any level, run
+        # VariableLengthMergeStates(partial_o[l] split rows) here BEFORE the
+        # cross-level merge to consolidate chunks into the first
+        # total_qo_rows of partial_o[l].
+        N = self._total_qo_rows_int
+        out.copy_(self._partial_o[0, :N])
+        lse.copy_(self._partial_lse[0, :N])
+        for l in range(1, self._num_levels):
             merge_state_in_place(
-                out, lse, self._partial_o[l], self._partial_lse[l]
+                out, lse, self._partial_o[l, :N], self._partial_lse[l, :N]
             )
 
         if wants_lse:

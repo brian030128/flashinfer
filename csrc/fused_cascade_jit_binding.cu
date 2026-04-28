@@ -20,8 +20,8 @@ void FusedMultiLevelCascadePagedRun(
     TensorView request_indices_buf, TensorView qo_tile_indices_buf,
     TensorView kv_tile_indices_buf, TensorView o_indptr_buf,
     TensorView kv_chunk_size_ptr_buf, TensorView level_id_per_cta,
-    TensorView out_o, TensorView out_lse,
-    TensorView partial_o, TensorView partial_lse, Array<int64_t> level_metadata,
+    TensorView partial_o, TensorView partial_lse,
+    Array<int64_t> level_metadata,
     int64_t num_levels, int64_t layout, int64_t window_left, double sm_scale,
     int64_t cta_tile_q_runtime, bool enable_pdl);
 
