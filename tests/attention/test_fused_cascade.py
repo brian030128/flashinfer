@@ -441,10 +441,14 @@ def test_fused_cascade_n_level_matches_baseline(num_levels, batch_size, head_dim
     torch.testing.assert_close(fused, baseline, rtol=2e-2, atol=2e-2)
 
 
-# Mixed-pool: gqa=8 means batch=4 at L0 produces packed=32 (pool_64), while
-# L1 per-row queries produce packed=8 (pool_16). Both pool launches fire in
-# one call -- locks in the two-pool dispatch path.
-@pytest.mark.parametrize("batch_size", [4, 8])
+# Mixed-pool routes: gqa=8 means
+#   batch=4  -> packed_L0=32  (route B: pool_64 + pool_16)
+#   batch=8  -> packed_L0=64  (route B: pool_64 + pool_16; boundary)
+#   batch=16 -> packed_L0=128 (route A: pool_128 + pool_16)
+#   batch=20 -> packed_L0=160 (route A: 1*pool_128 + 1*pool_128 leftover>16)
+# Both pool launches fire in one call -- locks in the two-pool dispatch path
+# for both routes.
+@pytest.mark.parametrize("batch_size", [4, 8, 16, 20])
 @pytest.mark.parametrize("shared_kv_pages", [8, 32])
 @pytest.mark.parametrize("unique_kv_pages_per_req", [1, 4])
 def test_fused_cascade_two_level_mixed_pool_gqa(

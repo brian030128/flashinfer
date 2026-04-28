@@ -615,25 +615,32 @@ class FusedMultiLevelCascadeAttentionWrapper:
     def _schedule_level_two_pool(
         qo_indptr_h: List[int],
         gqa_group_size: int,
+        large_cta_tile_q: int,
     ) -> Tuple[
-        List[int], List[int],   # pool_64: request_indices, qo_tile_indices
-        List[int], List[int],   # pool_16: request_indices, qo_tile_indices
+        List[int], List[int],   # large pool: request_indices, qo_tile_indices
+        List[int], List[int],   # pool_16:    request_indices, qo_tile_indices
         List[int],              # o_indptr (shared, per-request)
     ]:
-        """Two-pool work-tile scheduler. Per group with `n` queries:
-        - packed = n * gqa_group_size
+        """Two-pool work-tile scheduler. ``large_cta_tile_q`` is 64 (route B)
+        or 128 (route A); the small pool always uses CTA_TILE_Q=16.
+
+        Per group with ``n`` queries (packed = n * gqa_group_size):
         - packed <= 16: 1 tile in pool_16 (qo_tile_idx=0)
-        - 16 < packed <= 64: 1 tile in pool_64 (qo_tile_idx=0)
-        - packed > 64: floor(packed/64) pool_64 tiles followed by 1 leftover
-          tile (pool_16 if leftover<=16 else pool_64). qo_tile_idx is the
-          tile's offset *in its pool's tile-grid*, so the kernel's
-          `qo_packed_idx_base = qo_tile_idx * CTA_TILE_Q` maps to the
-          correct packed-row range. e.g. packed=72 split as
-          1*pool_64(qo_tile_idx=0, covers packed 0..63) + 1*pool_16
+        - 16 < packed <= large: 1 tile in large pool
+        - packed > large: floor(packed/large) large-pool tiles followed by
+          1 leftover tile (pool_16 if leftover<=16 else large pool).
+          qo_tile_idx is the tile's offset *in its pool's tile-grid*, so the
+          kernel's ``qo_packed_idx_base = qo_tile_idx * CTA_TILE_Q`` maps to
+          the correct packed-row range. e.g. with large=64, packed=72 splits
+          as 1*pool_64(qo_tile_idx=0, covers packed 0..63) + 1*pool_16
           (qo_tile_idx=4, covers packed 64..79).
         """
-        req64: List[int] = []
-        tile64: List[int] = []
+        # Validate so the pool_16-leftover index math (full * large/16) is
+        # exact. 16, 64, 128 all satisfy this.
+        assert large_cta_tile_q % 16 == 0, large_cta_tile_q
+        ratio = large_cta_tile_q // 16  # how many pool_16 tiles cover one large tile
+        req_lg: List[int] = []
+        tile_lg: List[int] = []
         req16: List[int] = []
         tile16: List[int] = []
         o_indptr: List[int] = [0]
@@ -644,27 +651,28 @@ class FusedMultiLevelCascadeAttentionWrapper:
             if packed <= 16:
                 req16.append(i)
                 tile16.append(0)
-            elif packed <= 64:
-                req64.append(i)
-                tile64.append(0)
+            elif packed <= large_cta_tile_q:
+                req_lg.append(i)
+                tile_lg.append(0)
             else:
-                full = packed // 64
-                leftover = packed - full * 64
+                full = packed // large_cta_tile_q
+                leftover = packed - full * large_cta_tile_q
                 for t in range(full):
-                    req64.append(i)
-                    tile64.append(t)
+                    req_lg.append(i)
+                    tile_lg.append(t)
                 if leftover > 0:
                     if leftover <= 16:
-                        # pool_16 tile starts at packed = full*64; in pool_16's
-                        # tile grid (CTA_TILE_Q=16) that's tile index full*4.
+                        # pool_16 tile starts at packed = full*large; in
+                        # pool_16's tile grid (CTA_TILE_Q=16) that's tile
+                        # index full*ratio.
                         req16.append(i)
-                        tile16.append(full * 4)
+                        tile16.append(full * ratio)
                     else:
-                        # pool_64 tile covers leftover<=64 with padding.
-                        req64.append(i)
-                        tile64.append(full)
+                        # large-pool tile covers 16<leftover<=large with padding.
+                        req_lg.append(i)
+                        tile_lg.append(full)
             o_indptr.append(o_indptr[-1] + qo_len)
-        return req64, tile64, req16, tile16, o_indptr
+        return req_lg, tile_lg, req16, tile16, o_indptr
 
     def __init__(
         self,
@@ -850,13 +858,30 @@ class FusedMultiLevelCascadeAttentionWrapper:
                     "of the rows handled by the root level."
                 )
 
-        # Two-pool scheduler: one set of buffers per cta_tile_q (16, 64).
-        # Per-pool state, indexed by pool_idx ∈ {0=pool_64, 1=pool_16}.
-        # Each pool gets its own request_indices/qo_tile_indices/kv_tile_indices/
-        # level_id_per_cta/level_metadata/kv_chunk_size_ptr concatenations.
-        # The user inputs (qo_indptr / paged_kv_*) and the per-request o_indptr
-        # are SHARED across pools because both pools reference the same problem
-        # data; only the tile schedule differs.
+        # Pick a route based on the largest packed_qo across all levels:
+        #   max_packed > 64  -> route A: large pool = 128, small pool = 16
+        #   max_packed <= 64 -> route B: large pool =  64, small pool = 16
+        # Route A wins when any group has packed in (64, 128] -- with route B
+        # those groups would split into two pool_64 tiles, each scanning the
+        # full KV (2x bandwidth at L0). Route B wins for purely-small workloads
+        # because using pool_128 for packed<=64 wastes 50%+ of MMA cycles to
+        # padding.
+        max_packed = 0
+        for qh in qo_indptr_h_arr:
+            for i in range(len(qh) - 1):
+                p = (qh[i + 1] - qh[i]) * gqa_group_size
+                if p > max_packed:
+                    max_packed = p
+        large_cta_tile_q = 128 if max_packed > 64 else 64
+
+        # Two-pool scheduler: one set of buffers per cta_tile_q
+        # (16, large_cta_tile_q). Per-pool state, indexed by
+        # pool_idx ∈ {0=large pool, 1=pool_16}. Each pool gets its own
+        # request_indices/qo_tile_indices/kv_tile_indices/level_id_per_cta/
+        # level_metadata/kv_chunk_size_ptr concatenations. The user inputs
+        # (qo_indptr / paged_kv_*) and the per-request o_indptr are SHARED
+        # across pools because both pools reference the same problem data;
+        # only the tile schedule differs.
         per_pool_request_chunks: List[List[torch.Tensor]] = [[], []]
         per_pool_tile_chunks: List[List[torch.Tensor]] = [[], []]
         per_pool_kv_tile_chunks: List[List[torch.Tensor]] = [[], []]
@@ -867,15 +892,15 @@ class FusedMultiLevelCascadeAttentionWrapper:
         o_indptr_chunks: List[torch.Tensor] = []
 
         for l in range(self._num_levels):
-            req64, tile64, req16, tile16, o_ind = self._schedule_level_two_pool(
-                qo_indptr_h_arr[l], gqa_group_size
+            req_lg, tile_lg, req16, tile16, o_ind = self._schedule_level_two_pool(
+                qo_indptr_h_arr[l], gqa_group_size, large_cta_tile_q
             )
             batch_l = len(qo_indptr_h_arr[l]) - 1
             num_pages_l = paged_kv_indices_arr[l].numel()
             o_indptr_chunks.append(
                 torch.tensor(o_ind, dtype=torch.int32, device=device)
             )
-            for pool_idx, (req, tile) in enumerate([(req64, tile64), (req16, tile16)]):
+            for pool_idx, (req, tile) in enumerate([(req_lg, tile_lg), (req16, tile16)]):
                 padded_batch_l = len(req)
                 per_pool_request_chunks[pool_idx].append(
                     torch.tensor(req, dtype=torch.int32, device=device)
@@ -920,14 +945,14 @@ class FusedMultiLevelCascadeAttentionWrapper:
                 else torch.empty(0, dtype=torch.int32, device=device)
             )
 
-        pool_64_request_indices_buf = _maybe_cat(per_pool_request_chunks[0])
-        pool_64_qo_tile_indices_buf = _maybe_cat(per_pool_tile_chunks[0])
-        pool_64_kv_tile_indices_buf = _maybe_cat(per_pool_kv_tile_chunks[0])
-        pool_64_level_id_per_cta = _maybe_cat(per_pool_level_id_chunks[0])
-        pool_64_kv_chunk_size_ptr_buf = torch.tensor(
+        pool_lg_request_indices_buf = _maybe_cat(per_pool_request_chunks[0])
+        pool_lg_qo_tile_indices_buf = _maybe_cat(per_pool_tile_chunks[0])
+        pool_lg_kv_tile_indices_buf = _maybe_cat(per_pool_kv_tile_chunks[0])
+        pool_lg_level_id_per_cta = _maybe_cat(per_pool_level_id_chunks[0])
+        pool_lg_kv_chunk_size_ptr_buf = torch.tensor(
             per_pool_kv_chunk_size_values[0], dtype=torch.int32, device=device
         )
-        pool_64_level_metadata = per_pool_level_metadata[0]
+        pool_lg_level_metadata = per_pool_level_metadata[0]
 
         pool_16_request_indices_buf = _maybe_cat(per_pool_request_chunks[1])
         pool_16_qo_tile_indices_buf = _maybe_cat(per_pool_tile_chunks[1])
@@ -971,16 +996,18 @@ class FusedMultiLevelCascadeAttentionWrapper:
         self._partial_o = partial_o
         self._partial_lse = partial_lse
 
-        # Stash per-pool scheduler outputs. Pool index 0 = CTA_TILE_Q=64,
-        # pool index 1 = CTA_TILE_Q=16. Each pool may have 0 work if no
-        # tiles fall into it; in that case we skip its launch in run().
-        self._pool_64_request_indices_buf = pool_64_request_indices_buf
-        self._pool_64_qo_tile_indices_buf = pool_64_qo_tile_indices_buf
-        self._pool_64_kv_tile_indices_buf = pool_64_kv_tile_indices_buf
-        self._pool_64_kv_chunk_size_ptr_buf = pool_64_kv_chunk_size_ptr_buf
-        self._pool_64_level_id_per_cta = pool_64_level_id_per_cta
-        self._pool_64_level_metadata = pool_64_level_metadata
-        self._pool_64_total_ctas = per_pool_total_ctas[0]
+        # Stash per-pool scheduler outputs. Pool index 0 = large pool
+        # (CTA_TILE_Q=large_cta_tile_q, picked above), pool index 1 =
+        # CTA_TILE_Q=16. Each pool may have 0 work if no tiles fall into it;
+        # in that case we skip its launch in run().
+        self._large_cta_tile_q = large_cta_tile_q
+        self._pool_lg_request_indices_buf = pool_lg_request_indices_buf
+        self._pool_lg_qo_tile_indices_buf = pool_lg_qo_tile_indices_buf
+        self._pool_lg_kv_tile_indices_buf = pool_lg_kv_tile_indices_buf
+        self._pool_lg_kv_chunk_size_ptr_buf = pool_lg_kv_chunk_size_ptr_buf
+        self._pool_lg_level_id_per_cta = pool_lg_level_id_per_cta
+        self._pool_lg_level_metadata = pool_lg_level_metadata
+        self._pool_lg_total_ctas = per_pool_total_ctas[0]
 
         self._pool_16_request_indices_buf = pool_16_request_indices_buf
         self._pool_16_qo_tile_indices_buf = pool_16_qo_tile_indices_buf
@@ -1077,12 +1104,13 @@ class FusedMultiLevelCascadeAttentionWrapper:
             lse.fill_(float("-inf"))
             out.zero_()
 
-        # Two-pool dispatch: launch CTA_TILE_Q=64 kernel first (carries the
-        # large-prefix work), then CTA_TILE_Q=16 (per-row work + small
+        # Two-pool dispatch: launch the large-pool kernel first (carries the
+        # shared-prefix work; CTA_TILE_Q is 64 or 128 depending on the route
+        # picked in plan()), then CTA_TILE_Q=16 (per-row work + small
         # leftovers). Skip a launch if its pool has no tiles. Each launch
         # runs the same fused kernel template with its CTA_TILE_Q baked in,
         # so the compiler gets unrestricted scheduling on each path.
-        if self._pool_64_total_ctas > 0:
+        if self._pool_lg_total_ctas > 0:
             self._cached_module.fused_paged_run(
                 q,
                 k_cache,
@@ -1091,22 +1119,22 @@ class FusedMultiLevelCascadeAttentionWrapper:
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
-                self._pool_64_request_indices_buf,
-                self._pool_64_qo_tile_indices_buf,
-                self._pool_64_kv_tile_indices_buf,
+                self._pool_lg_request_indices_buf,
+                self._pool_lg_qo_tile_indices_buf,
+                self._pool_lg_kv_tile_indices_buf,
                 self._o_indptr_buf,
-                self._pool_64_kv_chunk_size_ptr_buf,
-                self._pool_64_level_id_per_cta,
+                self._pool_lg_kv_chunk_size_ptr_buf,
+                self._pool_lg_level_id_per_cta,
                 out,
                 lse,
                 self._partial_o,
                 self._partial_lse,
-                self._pool_64_level_metadata,
+                self._pool_lg_level_metadata,
                 self._num_levels,
                 TensorLayout[self._kv_layout].value,
                 self._window_left,
                 self._sm_scale,
-                64,
+                self._large_cta_tile_q,
                 enable_pdl,
             )
         if self._pool_16_total_ctas > 0:
