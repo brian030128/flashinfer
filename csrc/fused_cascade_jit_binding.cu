@@ -25,4 +25,9 @@ void FusedMultiLevelCascadePagedRun(
     int64_t num_levels, int64_t layout, int64_t window_left, double sm_scale,
     int64_t cta_tile_q_runtime, bool enable_pdl);
 
+void CascadePersistentMerge(TensorView partial_o, TensorView partial_lse, TensorView out,
+                            TensorView lse_out, Array<int64_t> qo_len_per_level,
+                            Array<int64_t> num_chunks_per_level, int64_t total_qo_rows);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_paged_run, FusedMultiLevelCascadePagedRun);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cascade_persistent_merge, CascadePersistentMerge);

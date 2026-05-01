@@ -200,3 +200,57 @@ void FusedMultiLevelCascadePagedRun(
         return true;
       });
 }
+
+// Folds split-K chunks per level + cross-level merge + writes final out/lse,
+// all in one kernel launch. Replaces the post-prefill chain of
+// merge_states (per-split-level) + out.copy_/lse.copy_ + merge_state_in_place
+// (per non-final level). For uniform L=2 with one split level, that chain is
+// 3 launches; this collapses to 1.
+//
+// `qo_len_per_level` and `num_chunks_per_level` are int32 host arrays of length
+// num_levels. They're small (<= MAX_LEVELS = 4) and pass through __grid_constant__,
+// so we read them once per FFI call rather than touching device memory.
+void CascadePersistentMerge(TensorView partial_o, TensorView partial_lse, TensorView out,
+                            TensorView lse_out, Array<int64_t> qo_len_per_level,
+                            Array<int64_t> num_chunks_per_level, int64_t total_qo_rows) {
+  const int64_t num_levels = static_cast<int64_t>(qo_len_per_level.size());
+  TVM_FFI_ICHECK_GE(num_levels, 1);
+  TVM_FFI_ICHECK_LE(num_levels, MAX_LEVELS);
+  TVM_FFI_ICHECK_EQ(static_cast<int64_t>(num_chunks_per_level.size()), num_levels);
+
+  CHECK_DIM(4, partial_o);  // [num_levels, max_rows, num_heads, head_dim]
+  CHECK_DIM(3, partial_lse);
+  CHECK_DIM(3, out);  // [N, num_heads, head_dim]
+  CHECK_DIM(2, lse_out);
+
+  const uint32_t num_heads = static_cast<uint32_t>(out.size(1));
+  const uint32_t head_dim = static_cast<uint32_t>(out.size(2));
+  TVM_FFI_ICHECK_EQ(partial_o.size(2), num_heads);
+  TVM_FFI_ICHECK_EQ(partial_o.size(3), head_dim);
+
+  ffi::CUDADeviceGuard device_guard(out.device().device_id);
+  const cudaStream_t stream = get_stream(out.device());
+
+  CascadeMergeMeta<MAX_LEVELS> meta{};
+  meta.num_levels = static_cast<uint32_t>(num_levels);
+  for (int64_t l = 0; l < num_levels; ++l) {
+    meta.qo_len_per_level[l] = static_cast<int32_t>(qo_len_per_level[l]);
+    meta.num_chunks_per_level[l] = static_cast<int32_t>(num_chunks_per_level[l]);
+  }
+  for (int64_t l = num_levels; l < MAX_LEVELS; ++l) {
+    meta.qo_len_per_level[l] = 0;
+    meta.num_chunks_per_level[l] = 1;
+  }
+
+  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(out.dtype(), c_type, [&] {
+    cudaError_t status = flashinfer::CascadeMerge<MAX_LEVELS, c_type, c_type>(
+        static_cast<c_type*>(partial_o.data_ptr()), static_cast<float*>(partial_lse.data_ptr()),
+        partial_o.stride(0), partial_lse.stride(0), static_cast<c_type*>(out.data_ptr()),
+        static_cast<float*>(lse_out.data_ptr()), meta, static_cast<uint32_t>(total_qo_rows),
+        num_heads, head_dim, stream);
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "CascadePersistentMerge failed: " << cudaGetErrorString(status);
+    return true;
+  });
+  TVM_FFI_ICHECK(success) << "CascadePersistentMerge failed: unsupported data type.";
+}
