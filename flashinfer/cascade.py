@@ -391,13 +391,45 @@ class MultiLevelCascadeAttentionWrapper:
                     strict=True,
                 )
             ]
+            # Decode wrappers share the paged-kv buffers with the prefill
+            # wrappers; only one of the two is active per level after plan().
+            self._batch_decode_wrappers = [
+                BatchDecodeWithPagedKVCacheWrapper(
+                    float_workspace_buffer,
+                    kv_layout,
+                    use_cuda_graph=True,
+                    paged_kv_indptr_buffer=paged_kv_indptr_buf,
+                    paged_kv_indices_buffer=paged_kv_indices_buf,
+                    paged_kv_last_page_len_buffer=paged_kv_last_page_len_buf,
+                )
+                for (
+                    paged_kv_indptr_buf,
+                    paged_kv_indices_buf,
+                    paged_kv_last_page_len_buf,
+                ) in zip(
+                    paged_kv_indptr_buf_arr,
+                    paged_kv_indices_buf_arr,
+                    paged_kv_last_page_len_buf_arr,
+                    strict=True,
+                )
+            ]
         else:
             self._batch_prefill_wrappers = [
                 BatchPrefillWithPagedKVCacheWrapper(float_workspace_buffer, kv_layout)
                 for _ in range(num_levels)
             ]
+            self._batch_decode_wrappers = [
+                BatchDecodeWithPagedKVCacheWrapper(float_workspace_buffer, kv_layout)
+                for _ in range(num_levels)
+            ]
         self._num_levels = num_levels
         self._kv_layout = kv_layout
+        # Per-level dispatch: True if every group in this level has q_len == 1.
+        # In that case we route through BatchDecodeWithPagedKVCacheWrapper, whose
+        # CUDA-core path is tuned for q=1 register usage and avoids the q-tiled
+        # MMA setup the prefill kernel pays even when 15/16 of the tile is empty.
+        # Decided at plan() time and held until the next plan().
+        self._level_uses_decode: List[bool] = [False] * num_levels
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -507,15 +539,16 @@ class MultiLevelCascadeAttentionWrapper:
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         """
+        # Reset per-level dispatch decisions; recomputed below from qo_indptr.
+        self._level_uses_decode = [False] * self._num_levels
+
         for i, (
-            wrapper,
             qo_indptr,
             paged_kv_indptr,
             paged_kv_indices,
-            paged_kv_last_page_len,
+            paged_kv_last_page_len_i,
         ) in enumerate(
             zip(
-                self._batch_prefill_wrappers,
                 qo_indptr_arr,
                 paged_kv_indptr_arr,
                 paged_kv_indices_arr,
@@ -523,26 +556,55 @@ class MultiLevelCascadeAttentionWrapper:
                 strict=True,
             )
         ):
-            wrapper.plan(
-                qo_indptr,
-                paged_kv_indptr,
-                paged_kv_indices,
-                paged_kv_last_page_len,
-                num_qo_heads,
-                num_kv_heads,
-                head_dim,
-                page_size,
-                causal=causal if i == self._num_levels - 1 else False,
-                pos_encoding_mode=pos_encoding_mode,
-                use_fp16_qk_reduction=use_fp16_qk_reduction,
-                sm_scale=sm_scale,
-                window_left=window_left,
-                logits_soft_cap=logits_soft_cap,
-                rope_scale=rope_scale,
-                rope_theta=rope_theta,
-                q_data_type=q_data_type,
-                kv_data_type=kv_data_type,
-            )
+            # Detect "all groups have q_len == 1" — i.e., qo_indptr is the
+            # arange [0, 1, 2, ..., N]. We deliberately avoid pulling the
+            # whole indptr to CPU; one diff + all() is enough and runs once
+            # at plan time (not under CUDA graph capture).
+            diffs = qo_indptr[1:] - qo_indptr[:-1]
+            all_q_one = bool(torch.all(diffs == 1).item())
+            self._level_uses_decode[i] = all_q_one
+
+            if all_q_one:
+                # Decode kernel: q_len=1 is implicit, no causal arg needed
+                # (a single query position is trivially causal).
+                self._batch_decode_wrappers[i].plan(
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    paged_kv_last_page_len_i,
+                    num_qo_heads,
+                    num_kv_heads,
+                    head_dim,
+                    page_size,
+                    pos_encoding_mode=pos_encoding_mode,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    sm_scale=sm_scale,
+                    rope_scale=rope_scale,
+                    rope_theta=rope_theta,
+                    q_data_type=q_data_type,
+                    kv_data_type=kv_data_type,
+                )
+            else:
+                self._batch_prefill_wrappers[i].plan(
+                    qo_indptr,
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    paged_kv_last_page_len_i,
+                    num_qo_heads,
+                    num_kv_heads,
+                    head_dim,
+                    page_size,
+                    causal=causal if i == self._num_levels - 1 else False,
+                    pos_encoding_mode=pos_encoding_mode,
+                    use_fp16_qk_reduction=use_fp16_qk_reduction,
+                    sm_scale=sm_scale,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    rope_scale=rope_scale,
+                    rope_theta=rope_theta,
+                    q_data_type=q_data_type,
+                    kv_data_type=kv_data_type,
+                )
 
     begin_forward = plan
 
@@ -572,13 +634,24 @@ class MultiLevelCascadeAttentionWrapper:
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
         """
-        out, lse = self._batch_prefill_wrappers[-1].run(
-            q,
-            paged_kv_cache,
-            return_lse=True,
-        )
-        for wrapper in self._batch_prefill_wrappers[:-1]:
-            out_i, lse_i = wrapper.run(q, paged_kv_cache, return_lse=True)
+        last = self._num_levels - 1
+        if self._level_uses_decode[last]:
+            out, lse = self._batch_decode_wrappers[last].run(
+                q, paged_kv_cache, return_lse=True
+            )
+        else:
+            out, lse = self._batch_prefill_wrappers[last].run(
+                q, paged_kv_cache, return_lse=True
+            )
+        for i in range(last):
+            if self._level_uses_decode[i]:
+                out_i, lse_i = self._batch_decode_wrappers[i].run(
+                    q, paged_kv_cache, return_lse=True
+                )
+            else:
+                out_i, lse_i = self._batch_prefill_wrappers[i].run(
+                    q, paged_kv_cache, return_lse=True
+                )
             merge_state_in_place(out, lse, out_i, lse_i)
 
         return out
