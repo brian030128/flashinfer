@@ -393,11 +393,15 @@ class MultiLevelCascadeAttentionWrapper:
             ]
             # Decode wrappers share the paged-kv buffers with the prefill
             # wrappers; only one of the two is active per level after plan().
+            # use_tensor_cores=True so the q=1 path can batch GQA queries into
+            # an MMA tile across requests when the group is wide enough — this
+            # is what lets a wide stem-share level keep up with prefill.
             self._batch_decode_wrappers = [
                 BatchDecodeWithPagedKVCacheWrapper(
                     float_workspace_buffer,
                     kv_layout,
                     use_cuda_graph=True,
+                    use_tensor_cores=True,
                     paged_kv_indptr_buffer=paged_kv_indptr_buf,
                     paged_kv_indices_buffer=paged_kv_indices_buf,
                     paged_kv_last_page_len_buffer=paged_kv_last_page_len_buf,
@@ -419,15 +423,21 @@ class MultiLevelCascadeAttentionWrapper:
                 for _ in range(num_levels)
             ]
             self._batch_decode_wrappers = [
-                BatchDecodeWithPagedKVCacheWrapper(float_workspace_buffer, kv_layout)
+                BatchDecodeWithPagedKVCacheWrapper(
+                    float_workspace_buffer,
+                    kv_layout,
+                    use_tensor_cores=True,
+                )
                 for _ in range(num_levels)
             ]
         self._num_levels = num_levels
         self._kv_layout = kv_layout
         # Per-level dispatch: True if every group in this level has q_len == 1.
-        # In that case we route through BatchDecodeWithPagedKVCacheWrapper, whose
-        # CUDA-core path is tuned for q=1 register usage and avoids the q-tiled
-        # MMA setup the prefill kernel pays even when 15/16 of the tile is empty.
+        # In that case we route through BatchDecodeWithPagedKVCacheWrapper.
+        # The decode wrapper is constructed with use_tensor_cores=True so the
+        # GQA group queries get packed into MMA tiles across requests, which is
+        # what lets a wide-fanout decode level (e.g. cascade L1 with N q=1
+        # groups all sharing the same stem prefix) reach Tensor-Core throughput.
         # Decided at plan() time and held until the next plan().
         self._level_uses_decode: List[bool] = [False] * num_levels
 
