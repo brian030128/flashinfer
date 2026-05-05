@@ -786,6 +786,79 @@ class FusedMultiLevelCascadeAttentionWrapper:
         head_dim_qk: Optional[int] = None,
         head_dim_vo: Optional[int] = None,
         use_profiler: bool = False,
+        force_cta_tile_q: Optional[int] = None,
+    ) -> None:
+        # Per-call override of the constructor-time _force_cta_tile_q. Used
+        # by the bs_kernel cost model (`Pick.t_large`) to vary T per step
+        # without recreating the wrapper. None → fall back to the
+        # constructor's setting.
+        if force_cta_tile_q is not None and force_cta_tile_q not in (16, 64, 128):
+            raise ValueError(
+                f"force_cta_tile_q must be 16, 64, or 128 (or None); "
+                f"got {force_cta_tile_q}"
+            )
+        _saved_force_cta_tile_q = self._force_cta_tile_q
+        if force_cta_tile_q is not None:
+            self._force_cta_tile_q = force_cta_tile_q
+        try:
+            return self._plan_inner(
+                qo_indptr_arr=qo_indptr_arr,
+                paged_kv_indptr_arr=paged_kv_indptr_arr,
+                paged_kv_indices_arr=paged_kv_indices_arr,
+                paged_kv_last_page_len=paged_kv_last_page_len,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                causal=causal,
+                pos_encoding_mode=pos_encoding_mode,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                sm_scale=sm_scale,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                rope_scale=rope_scale,
+                rope_theta=rope_theta,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                kv_indptr_arr=kv_indptr_arr,
+                kv_indices_arr=kv_indices_arr,
+                kv_len_arr=kv_len_arr,
+                paged_kv_last_page_len_arr=paged_kv_last_page_len_arr,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                use_profiler=use_profiler,
+            )
+        finally:
+            self._force_cta_tile_q = _saved_force_cta_tile_q
+
+    def _plan_inner(
+        self,
+        qo_indptr_arr: List[torch.Tensor],
+        paged_kv_indptr_arr: Optional[List[torch.Tensor]] = None,
+        paged_kv_indices_arr: Optional[List[torch.Tensor]] = None,
+        paged_kv_last_page_len: Optional[List[torch.Tensor]] = None,
+        num_qo_heads: Optional[int] = None,
+        num_kv_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
+        page_size: Optional[int] = None,
+        causal: bool = False,
+        pos_encoding_mode: str = "NONE",
+        use_fp16_qk_reduction: bool = False,
+        sm_scale: Optional[float] = None,
+        window_left: int = -1,
+        logits_soft_cap: Optional[float] = None,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+        q_data_type: Union[str, torch.dtype] = torch.float16,
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        *,
+        kv_indptr_arr: Optional[List[torch.Tensor]] = None,
+        kv_indices_arr: Optional[List[torch.Tensor]] = None,
+        kv_len_arr: Optional[List[torch.Tensor]] = None,
+        paged_kv_last_page_len_arr: Optional[List[torch.Tensor]] = None,
+        head_dim_qk: Optional[int] = None,
+        head_dim_vo: Optional[int] = None,
+        use_profiler: bool = False,
     ) -> None:
         # Resolve naming-style aliases.
         if paged_kv_indptr_arr is None:
