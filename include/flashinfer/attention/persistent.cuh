@@ -173,6 +173,40 @@ __device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_V
   }
 }
 
+// Cascade draft suffix packing: a level-1 work item holds G = cascade_branch_group
+// branches (one query token each) whose suffix KV sits at stride D =
+// cascade_branch_stride, so query token t may only attend KV [t * D, t * D + s).
+// The per-step valid length s is recovered from kv_end = (G - 1) * D + s, which
+// update_draft_step patches per step.
+template <typename KTraits>
+__device__ __forceinline__ void branch_diag_mask(
+    const uint32_t branch_stride, const uint32_t branch_group, const uint32_t qo_packed_idx_base,
+    const uint32_t kv_idx_base, const uint32_t kv_end, const uint_fastdiv group_size,
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8], const uint32_t lane_idx) {
+  const uint32_t s = kv_end - (branch_group - 1) * branch_stride;
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+    uint32_t kv_lo[2];
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      kv_lo[j] = (uint32_t(qo_packed_idx_base + mma_q * 16 + lane_idx / 4 + 8 * j) / group_size) *
+                 branch_stride;
+    }
+#pragma unroll
+    for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+#pragma unroll
+      for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+        const uint32_t lo = kv_lo[(reg_id % 4) / 2];
+        const uint32_t kv_idx = kv_idx_base + mma_kv * 16 + 2 * (lane_idx % 4) +
+                                8 * (reg_id / 4) + reg_id % 2;
+        if (kv_idx < lo || kv_idx >= lo + s) {
+          s_frag[mma_q][mma_kv][reg_id] = KTraits::MaskFillValue;
+        }
+      }
+    }
+  }
+}
+
 template <typename KTraits_, typename Params_>
 struct BlockBatchPagedAttentionPersistent {
   using KTraits = KTraits_;
@@ -292,6 +326,9 @@ struct BlockBatchPagedAttentionPersistent {
           min(q_len, ceil_div(packed_qo_start + (blockIdx.x + 1) * CTA_TILE_Q, gqa_group_size));
 
       init_states<KTraits>(variant, o_frag, m, d);
+      // Set only on the 16-row runner's params when the suffix is packed; the
+      // planner then routes exactly the last level's work items there.
+      const bool branch_packed = params.cascade_branch_stride != 0;
 
       DTypeQ* q_ptr_base = q + q_indptr * q_stride_n + (kv_head_idx * gqa_group_size) * q_stride_h;
 
@@ -359,6 +396,13 @@ struct BlockBatchPagedAttentionPersistent {
                                  NUM_MMA_KV * 16,
                   q_len, kv_len, kv_end, gqa_group_size, s_frag, tid, kv_head_idx);
             }
+            if (branch_packed) {
+              branch_diag_mask<KTraits>(
+                  params.cascade_branch_stride, params.cascade_branch_group, qo_packed_idx_base,
+                  kv_start + (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) *
+                                 NUM_MMA_KV * 16,
+                  kv_end, gqa_group_size, s_frag, lane_idx);
+            }
             update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
 
             __syncthreads();
@@ -395,6 +439,13 @@ struct BlockBatchPagedAttentionPersistent {
             kv_start +
                 (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
             q_len, kv_len, kv_end, gqa_group_size, s_frag, tid, kv_head_idx);
+        if (branch_packed) {
+          branch_diag_mask<KTraits>(
+              params.cascade_branch_stride, params.cascade_branch_group, qo_packed_idx_base,
+              kv_start +
+                  (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
+              kv_end, gqa_group_size, s_frag, lane_idx);
+        }
         update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
         compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
       }

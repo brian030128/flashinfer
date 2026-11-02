@@ -101,6 +101,9 @@ struct PersistentParams {
   IdType* num_packed_qo_len;
 
   uint32_t num_kv_heads;
+  // cascade draft suffix packing, see HolisticPlanInfo (0 = off)
+  uint32_t cascade_branch_stride;
+  uint32_t cascade_branch_group;
   uint_fastdiv gqa_group_size;
   uint_fastdiv page_size;
 

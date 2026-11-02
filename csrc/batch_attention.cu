@@ -176,6 +176,9 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.num_qo_len_offset);
 
           params[i].num_kv_heads = num_kv_heads;
+          // Packed suffix items are exactly the task-1 (16-row runner) items.
+          params[i].cascade_branch_stride = i == 1 ? plan_info.cascade_branch_stride : 0;
+          params[i].cascade_branch_group = plan_info.cascade_branch_group;
           params[i].gqa_group_size = uint_fastdiv(num_qo_heads / num_kv_heads);
           params[i].page_size = uint_fastdiv(page_size);
 
@@ -199,7 +202,7 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
 
         cudaError_t status;
         if (plan_info.tasks[0].cascade_num_kv_chunks_offset >= 0) {
-          status = CascadeBatchPagedAttention<128, 16, HEAD_DIM_QK, HEAD_DIM_VO,
+          status = CascadeBatchPagedAttention<FD_CASCADE_CTA_TILE_Q1, 16, HEAD_DIM_QK, HEAD_DIM_VO,
                                               MASK_MODE, AttentionVariant>(
               params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
         } else {
@@ -225,7 +228,11 @@ Array<int64_t> CascadeBatchPagedAttentionPlan(
     int64_t num_levels,
     int64_t num_qo_heads,
     int64_t num_kv_heads,
-    int64_t head_dim_o) {
+    int64_t head_dim_o,
+    int64_t branch_stride,
+    int64_t branch_group,
+    int64_t ctas_per_sm,
+    int64_t max_chunk_kv) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -265,7 +272,9 @@ Array<int64_t> CascadeBatchPagedAttentionPlan(
       kv_indices_level_offsets.data(),
       causal_flags.get(),
       batch_size_arr_vec.data(),
-      num_qo_heads, num_kv_heads, head_dim_o, stream);
+      num_qo_heads, num_kv_heads, head_dim_o, stream,
+      static_cast<uint32_t>(branch_stride), static_cast<uint32_t>(branch_group),
+      static_cast<int>(ctas_per_sm), static_cast<int>(max_chunk_kv));
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan cascade persistent attention, error: " << cudaGetErrorString(status);

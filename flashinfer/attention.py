@@ -268,7 +268,14 @@ class CascadeBatchAttentionWrapper:
         logits_soft_cap: Optional[float] = None,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: torch.dtype = torch.bfloat16,
+        pack_suffix: bool = False,
+        ctas_per_sm: int = 0,
+        max_chunk_kv: int = 0,
     ) -> None:
+        """pack_suffix: run G = 16 // GQA last-level branches (one query token each,
+        KV at a uniform stride) per 16-row tile instead of padding each branch's GQA
+        rows to 16; see _pack_last_level. ctas_per_sm / max_chunk_kv: planner
+        knobs, 0 = built-in default (cascade_tune.cuh)."""
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         self._logits_soft_cap = logits_soft_cap
@@ -290,6 +297,13 @@ class CascadeBatchAttentionWrapper:
         kv_indptr_host_arr = [t.to("cpu", non_blocking=True) for t in kv_indptr_arr]
         kv_len_host_arr = [t.to("cpu", non_blocking=True) for t in kv_len_arr]
         torch.cuda.synchronize()
+        self._knobs = (ctas_per_sm, max_chunk_kv)
+        qo_indptr_host_arr, kv_indptr_host_arr, kv_indices_arr, kv_len_host_arr = (
+            self._pack_last_level(
+                pack_suffix, num_qo_heads // num_kv_heads, qo_indptr_host_arr,
+                kv_indptr_host_arr, kv_indices_arr, kv_len_host_arr,
+            )
+        )
 
         self._page_size = page_size
         self._sm_scale = sm_scale
@@ -330,6 +344,10 @@ class CascadeBatchAttentionWrapper:
             num_qo_heads,
             num_kv_heads,
             head_dim_vo,
+            self._branch_stride,
+            self._branch_group,
+            self._knobs[0],
+            self._knobs[1],
         )
 
     def fast_cascade_plan(
@@ -348,6 +366,9 @@ class CascadeBatchAttentionWrapper:
         logits_soft_cap: Optional[float] = None,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: torch.dtype = torch.bfloat16,
+        pack_suffix: bool = False,
+        ctas_per_sm: int = 0,
+        max_chunk_kv: int = 0,
     ) -> None:
         """Fast plan that skips GPU->CPU transfers and torch.cuda.synchronize().
 
@@ -361,6 +382,13 @@ class CascadeBatchAttentionWrapper:
 
         # Reuse self.module from prior plan() call — no get_holistic_attention_module()
         # No GPU->CPU copy, no torch.cuda.synchronize()
+        self._knobs = (ctas_per_sm, max_chunk_kv)
+        qo_indptr_host_arr, kv_indptr_host_arr, kv_indices_arr, kv_len_host_arr = (
+            self._pack_last_level(
+                pack_suffix, num_qo_heads // num_kv_heads, qo_indptr_host_arr,
+                kv_indptr_host_arr, kv_indices_arr, kv_len_host_arr,
+            )
+        )
 
         self._page_size = page_size
         self._sm_scale = sm_scale
@@ -401,6 +429,10 @@ class CascadeBatchAttentionWrapper:
             num_qo_heads,
             num_kv_heads,
             head_dim_vo,
+            self._branch_stride,
+            self._branch_group,
+            self._knobs[0],
+            self._knobs[1],
         )
 
     def plan_for_draft(
@@ -421,6 +453,9 @@ class CascadeBatchAttentionWrapper:
         logits_soft_cap: Optional[float] = None,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: torch.dtype = torch.bfloat16,
+        pack_suffix: bool = False,
+        ctas_per_sm: int = 0,
+        max_chunk_kv: int = 0,
     ) -> None:
         """Plan once for max draft depth. Call update_draft_step() per step.
 
@@ -439,7 +474,8 @@ class CascadeBatchAttentionWrapper:
             head_dim_qk=head_dim_qk, head_dim_vo=head_dim_vo,
             page_size=page_size, causal=causal, sm_scale=sm_scale,
             logits_soft_cap=logits_soft_cap, q_data_type=q_data_type,
-            kv_data_type=kv_data_type,
+            kv_data_type=kv_data_type, pack_suffix=pack_suffix,
+            ctas_per_sm=ctas_per_sm, max_chunk_kv=max_chunk_kv,
         )
         if first_call:
             # plan() accepts GPU or CPU tensors (CPU is a no-op for .to("cpu"))
@@ -507,10 +543,58 @@ class CascadeBatchAttentionWrapper:
         """
         if not hasattr(self, "_draft_level2_indices"):
             return
+        step_kv_len, step_kv_end = self.packed_step_kv(step_kv_len, step_kv_end)
         buf = self.int_workspace_buffer.view(torch.int32)
         idx = self._draft_level2_indices
         buf[self._draft_kv_len_start + idx] = step_kv_len
         buf[self._draft_kv_end_start + idx] = step_kv_end
+
+    def packed_step_kv(self, step_kv_len: int, step_kv_end: int) -> Tuple[int, int]:
+        """Map a per-branch (kv_len, kv_end) patch to the packed work items' values.
+
+        A packed item spans G branches at stride D; branch t's valid KV is
+        [t * D, t * D + s), so the item's kv_end is (G - 1) * D + s (the kernel
+        recovers s from it). Identity when the suffix is not packed.
+        """
+        G, D = self._branch_group, self._branch_stride
+        if G == 0:
+            return step_kv_len, step_kv_end
+        kv_end = (G - 1) * D + step_kv_end
+        return kv_end + G, kv_end
+
+    def _pack_last_level(self, pack, gqa, qo_indptr, kv_indptr, kv_indices, kv_len):
+        """Group the last level's single-token branches G = 16 // gqa per work item.
+
+        Requires one query token per branch and a uniform KV stride D with equal
+        valid lengths L <= D (draft layout). Group g covers query rows
+        [g*G, min((g+1)*G, n)) and KV [g*G*D, g*G*D + (G-1)*D + L); the index
+        array is padded so the last (partial) group reads valid page ids.
+        """
+        self._branch_group = self._branch_stride = 0
+        G = 16 // gqa if 0 < gqa < 16 and 16 % gqa == 0 else 1
+        if not pack or G < 2:
+            return qo_indptr, kv_indptr, kv_indices, kv_len
+        qo, kv, ln = qo_indptr[-1], kv_indptr[-1], kv_len[-1]
+        n = qo.numel() - 1
+        if n == 0:
+            return qo_indptr, kv_indptr, kv_indices, kv_len
+        D = int(kv[1] - kv[0])
+        L = int(ln[0])
+        assert torch.equal(qo, torch.arange(n + 1, dtype=qo.dtype)), "one query token per branch"
+        assert torch.equal(kv, torch.arange(n + 1, dtype=kv.dtype) * D), "uniform KV stride"
+        assert bool((ln == L).all()) and 0 < L <= D, "equal branch lengths <= stride"
+        ng = (n + G - 1) // G
+        g = torch.arange(ng + 1, dtype=qo.dtype)
+        qo_g = torch.clamp(g * G, max=n)
+        kv_g = g * (G * D)
+        len_g = torch.full((ng,), (G - 1) * D + L, dtype=ln.dtype)
+        idx = kv_indices[-1]
+        pad = ng * G * D - idx.numel()
+        if pad > 0:
+            idx = torch.cat([idx, idx[:1].expand(pad)])
+        self._branch_group, self._branch_stride = G, D
+        return (qo_indptr[:-1] + [qo_g], kv_indptr[:-1] + [kv_g],
+                kv_indices[:-1] + [idx], kv_len[:-1] + [len_g])
 
     def run(
         self,

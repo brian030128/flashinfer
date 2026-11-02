@@ -47,7 +47,11 @@ Array<int64_t> CascadeBatchPagedAttentionPlan(
     int64_t num_levels,
     int64_t num_qo_heads,
     int64_t num_kv_heads,
-    int64_t head_dim_o);
+    int64_t head_dim_o,
+    int64_t branch_stride,
+    int64_t branch_group,
+    int64_t ctas_per_sm,
+    int64_t max_chunk_kv);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, &BatchPagedAttentionPlan);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cascade_plan, &CascadeBatchPagedAttentionPlan);

@@ -1827,6 +1827,20 @@ def gen_customize_batch_attention_module(
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
     }
+    # Cascade draft kernel tuning (see cascade_tune.cuh). Each setting
+    # compiles into its own module so cached builds never mix. "_fd2": packed
+    # suffix + runtime planner knobs (plan_info/cascade_plan signature changed).
+    uri = f"{uri}_fd3"
+    cascade_tune_flags = []
+    tune = os.environ.get("FLASHINFER_CASCADE_TUNE")
+    if tune:
+        tile_q1, ctas_per_sm, min_chunk_kv = (int(x) for x in tune.split(","))
+        uri = f"{uri}_cascade_tune_{tile_q1}_{ctas_per_sm}_{min_chunk_kv}"
+        cascade_tune_flags = [
+            f"-DFD_CASCADE_CTA_TILE_Q1={tile_q1}",
+            f"-DFD_CASCADE_CTAS_PER_SM={ctas_per_sm}",
+            f"-DFD_CASCADE_MIN_CHUNK_KV={min_chunk_kv}",
+        ]
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     (additional_params_decl, additional_func_params, additional_params_setter) = (
         generate_additional_params(
@@ -1884,7 +1898,8 @@ def gen_customize_batch_attention_module(
     return gen_jit_spec(
         uri,
         source_paths,
-        extra_cuda_cflags=["-DFLASHINFER_ENABLE_PROFILER"] if use_profiler else [],
+        extra_cuda_cflags=(["-DFLASHINFER_ENABLE_PROFILER"] if use_profiler else [])
+        + cascade_tune_flags,
     )
 
 

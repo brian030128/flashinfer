@@ -16,6 +16,7 @@
 #ifndef FLASHINFER_ATTENTION_SCHEDULER_CUH_
 #define FLASHINFER_ATTENTION_SCHEDULER_CUH_
 
+#include "cascade_tune.cuh"
 #include <cuda_runtime_api.h>
 #include <driver_types.h>
 
@@ -1043,9 +1044,14 @@ struct HolisticPlanInfo {
   int64_t merge_indptr_offset;
   int64_t merge_o_indices_offset;
   int64_t num_qo_len_offset;
+  // Cascade draft suffix packing (0 = off): level-1 work items hold
+  // cascade_branch_group branches whose suffix KV sits at stride
+  // cascade_branch_stride; the kernel masks each query token to its own branch.
+  int64_t cascade_branch_stride = 0;
+  int64_t cascade_branch_group = 0;
 
   static constexpr uint32_t NUM_TASK_ARGS = 12;
-  static constexpr uint32_t NUM_SHARED_ARGS = 8;
+  static constexpr uint32_t NUM_SHARED_ARGS = 10;
 
   std::vector<int64_t> ToVector() const {
     std::vector<int64_t> vec;
@@ -1071,6 +1077,8 @@ struct HolisticPlanInfo {
     vec.push_back(merge_indptr_offset);
     vec.push_back(merge_o_indices_offset);
     vec.push_back(num_qo_len_offset);
+    vec.push_back(cascade_branch_stride);
+    vec.push_back(cascade_branch_group);
     return vec;
   }
 
@@ -1103,6 +1111,8 @@ struct HolisticPlanInfo {
     merge_indptr_offset = vec[5 + NUM_TASKS * NUM_TASK_ARGS];
     merge_o_indices_offset = vec[6 + NUM_TASKS * NUM_TASK_ARGS];
     num_qo_len_offset = vec[7 + NUM_TASKS * NUM_TASK_ARGS];
+    cascade_branch_stride = vec[8 + NUM_TASKS * NUM_TASK_ARGS];
+    cascade_branch_group = vec[9 + NUM_TASKS * NUM_TASK_ARGS];
   }
 };
 
@@ -1391,9 +1401,19 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
                                        uint32_t* batch_size_arr,
                                        uint32_t num_qo_heads,
                                        uint32_t num_kv_heads, uint32_t head_dim,
-                                       cudaStream_t stream) {
+                                       cudaStream_t stream, uint32_t branch_stride = 0,
+                                       uint32_t branch_group = 0, int ctas_per_sm = 0,
+                                       int max_chunk_kv = 0) {
   constexpr uint32_t NUM_TASKS = 2;
-  const uint32_t CTA_TILE_Q_SIZES[NUM_TASKS] = {128, 16};
+  const uint32_t CTA_TILE_Q_SIZES[NUM_TASKS] = {FD_CASCADE_CTA_TILE_Q1, 16};
+  // Packed suffix: level >= 1 always runs on the 16-row runner and level 0 on the
+  // prefix runner (a full group is exactly 16 packed rows, which would otherwise
+  // route it to the prefix runner). The kernel relies on this: it applies the
+  // branch mask to every task-1 work item.
+  const bool route_by_level = branch_stride > 0 && num_levels >= 2;
+  plan_info.cascade_branch_stride = route_by_level ? branch_stride : 0;
+  plan_info.cascade_branch_group = route_by_level ? branch_group : 0;
+  if (max_chunk_kv <= 0) max_chunk_kv = FD_CASCADE_MIN_CHUNK_KV;
   int num_sm = 0;
   int dev_id = 0;
 
@@ -1413,7 +1433,8 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
         FLASHINFER_ERROR(err_msg.str());
       }
       int packed_qo_len = qo_len * gqa_group_size;
-      if (packed_qo_len >= static_cast<int>(CTA_TILE_Q_SIZES[1])) {
+      if (route_by_level ? level == 0
+                         : packed_qo_len >= static_cast<int>(CTA_TILE_Q_SIZES[1])) {
         idx_qo_len_vec[0].push_back({level, i, qo_len});
       } else {
         idx_qo_len_vec[1].push_back({level, i, qo_len});
@@ -1421,9 +1442,22 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
     }
   }
 
-  // Non-cooperative launch: 2 CTAs/SM. With CTA_TILE_Q_1=128 and NUM_MMA_KV=2,
-  // Runner1 smem is ~48KB, fitting 2 CTAs within A6000's 100KB max smem/SM.
-  num_sm *= 2;
+  // Non-cooperative launch: 2 CTAs/SM by default. With CTA_TILE_Q_1=128 and
+  // NUM_MMA_KV=2, Runner1 smem is ~48KB, fitting 2 CTAs within A6000's 100KB
+  // max smem/SM. Smaller Q tiles leave room for more (FD_CASCADE_CTAS_PER_SM).
+  // ctas_per_sm <= 0 and FD_CASCADE_CTAS_PER_SM == 0: pick from the prefix work
+  // count. With few (request, kv_head) prefix entries 2 CTAs/SM is best; once
+  // they reach a third of the SMs, 4 CTAs/SM balances better (A6000 sweep).
+  if (ctas_per_sm <= 0) ctas_per_sm = FD_CASCADE_CTAS_PER_SM;
+  if (ctas_per_sm <= 0) {
+    int prefix_entries = 0;
+    for (auto& [level, i, qo_len] : idx_qo_len_vec[0]) {
+      prefix_entries += ceil_div(qo_len * (int)gqa_group_size, (int)CTA_TILE_Q_SIZES[0]) *
+                        (int)num_kv_heads;
+    }
+    ctas_per_sm = (3 * prefix_entries >= num_sm) ? 4 : 2;
+  }
+  num_sm *= ctas_per_sm;
 
   int cluster_size = 1;
   int num_clusters = num_sm / cluster_size;
@@ -1490,7 +1524,7 @@ inline cudaError_t CascadeHolisticPlan(void* float_buffer, size_t float_workspac
       int target_floor = std::max(1, num_clusters / std::max(1, level_base_entries));
       int target_chunks = (level_base_entries * target_ceil <= num_clusters)
                               ? target_ceil : target_floor;
-      int target_chunks_min = std::max(1, level_max_kv / 1024);
+      int target_chunks_min = std::max(1, level_max_kv / max_chunk_kv);
       target_chunks = std::max(target_chunks, target_chunks_min);
       int kv_limit = f(std::max(level_max_kv / target_chunks, 1));
       level_task_kv_limit[level][task] = kv_limit;
