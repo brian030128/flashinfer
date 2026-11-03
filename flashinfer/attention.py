@@ -566,9 +566,13 @@ class CascadeBatchAttentionWrapper:
         """Group the last level's single-token branches G = 16 // gqa per work item.
 
         Requires one query token per branch and a uniform KV stride D with equal
-        valid lengths L <= D (draft layout). Group g covers query rows
-        [g*G, min((g+1)*G, n)) and KV [g*G*D, g*G*D + (G-1)*D + L); the index
-        array is padded so the last (partial) group reads valid page ids.
+        valid lengths L <= D (draft layout). Groups never straddle two first-level
+        requests: the cross-level merge lays out a work item's partial outputs
+        with one per-row stride, which only holds when all its rows share the
+        same request (and so the same number of prefix chunks). A group starting
+        at branch b reads KV [b*D, b*D + (G-1)*D + L); columns of branches
+        outside the group are masked by the kernel, and the index array is
+        padded to (n + G - 1) * D so the last group reads valid page ids.
         """
         self._branch_group = self._branch_stride = 0
         G = 16 // gqa if 0 < gqa < 16 and 16 % gqa == 0 else 1
@@ -583,13 +587,16 @@ class CascadeBatchAttentionWrapper:
         assert torch.equal(qo, torch.arange(n + 1, dtype=qo.dtype)), "one query token per branch"
         assert torch.equal(kv, torch.arange(n + 1, dtype=kv.dtype) * D), "uniform KV stride"
         assert bool((ln == L).all()) and 0 < L <= D, "equal branch lengths <= stride"
-        ng = (n + G - 1) // G
-        g = torch.arange(ng + 1, dtype=qo.dtype)
-        qo_g = torch.clamp(g * G, max=n)
-        kv_g = g * (G * D)
-        len_g = torch.full((ng,), (G - 1) * D + L, dtype=ln.dtype)
+        # Group boundaries: every G branches, restarting at each request boundary.
+        req = qo_indptr[0].to(torch.int64)
+        starts = torch.cat([torch.arange(int(req[r]), int(req[r + 1]), G)
+                            for r in range(req.numel() - 1)])
+        assert int(req[-1]) == n, "first level must cover every branch"
+        qo_g = torch.cat([starts, torch.tensor([n])]).to(qo.dtype)
+        kv_g = (qo_g * D).to(kv.dtype)
+        len_g = torch.full((starts.numel(),), (G - 1) * D + L, dtype=ln.dtype)
         idx = kv_indices[-1]
-        pad = ng * G * D - idx.numel()
+        pad = (n + G - 1) * D - idx.numel()
         if pad > 0:
             idx = torch.cat([idx, idx[:1].expand(pad)])
         self._branch_group, self._branch_stride = G, D
